@@ -1,0 +1,7 @@
+- Ensure that the draft carries over to the next event
+- evaluate if players from the bench should be added in 
+- evaluate if we need to trade players and it it is for my opponents or the players that are not already taken
+- ensure that we can pull current season and player statistics
+- make a flask application for the change in rosters over the weeks and for my oponents
+- the flask application should also have statistics for each game week and the different player performances
+- the flask application should also have a sum of the statistics per team and per player

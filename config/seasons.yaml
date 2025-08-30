@@ -1,0 +1,10 @@
+# Seasons are the END year in FBref/soccerdata (e.g., 2023 = 2022/23 season)
+#  is taken out due to no plays currently
+historical_seasons: [2022, 2023, 2024, 2025]  # last 3 completed seasons
+weights:
+  "2025": 2.0
+  "2024": 1.0
+  "2023": 0.7
+  "2022": 0.5
+current_season_end_year: 2026   # 2025/26 season
+league_code_fbref: "ENG-Premier League"

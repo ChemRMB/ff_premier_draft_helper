@@ -1,0 +1,81 @@
+# Map Sleeper stat abbreviations to normalized columns built from FBref/FotMob.
+# Adjust to taste. Not all stats exist in all sources; the scaffold populates what it can.
+# Any key missing here will be ignored in scoring until you add it.
+forwards:
+  g: goals
+  at: assists         # if you prefer assists points for F too
+  sot: shots_on_target
+  kp: key_passes
+  tkw: tackles_won
+  int: interceptions
+  bs: blocks_shots
+  aer: aerials_won
+  sm: dribbles_completed
+  cos: crosses_completed
+  dis: dispossessed
+  pks: penalties_won
+  pkm: penalties_missed
+  pkd: penalties_drawn   # optional if available
+  yc: yellow_cards
+  yc2: second_yellow     # will map to red if only reds available
+  rc: red_cards
+  min: minutes
+
+midfielders:
+  g: goals
+  at: assists
+  sot: shots_on_target
+  kp: key_passes
+  tkw: tackles_won
+  int: interceptions
+  bs: blocks_shots
+  aer: aerials_won
+  sm: dribbles_completed
+  cos: crosses_completed
+  dis: dispossessed
+  pks: penalties_won
+  pkm: penalties_missed
+  pkd: penalties_drawn
+  yc: yellow_cards
+  yc2: second_yellow
+  rc: red_cards
+  min: minutes
+  cs: clean_sheet       # credited if team kept CS and player >= 60'
+
+defenders:
+  g: goals
+  at: assists
+  sot: shots_on_target
+  kp: key_passes
+  tkw: tackles_won
+  int: interceptions
+  bs: blocks_shots
+  aer: aerials_won
+  sm: dribbles_completed
+  cos: crosses_completed
+  dis: dispossessed
+  pks: penalties_won
+  pkm: penalties_missed
+  pkd: penalties_drawn
+  yc: yellow_cards
+  yc2: second_yellow
+  rc: red_cards
+  min: minutes
+  cs: clean_sheet
+  ga: goals_conceded    # negative weight in Sleeper
+
+goalkeepers:
+  g: goals
+  at: assists
+  sv: saves
+  bs: blocks_shots      # rare for GK; if available
+  int: interceptions    # rare
+  kp: key_passes        # rare
+  min: minutes
+  cs: clean_sheet
+  ga: goals_conceded
+  pkd: penalties_drawn  # saved? depends on data
+  pks: penalties_saved  # map to saves on PK if available
+  og: own_goals
+  yc: yellow_cards
+  rc: red_cards

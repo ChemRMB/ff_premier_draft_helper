@@ -1,0 +1,54 @@
+{
+    "created": 1754565541092,
+    "creators": [
+        "1040229337494167552"
+    ],
+    "draft_id": "1259142777103470592",
+    "draft_order": {
+        "1040228673850417152": 1,
+        "1040229337494167552": 7,
+        "1259160051570978816": 3,
+        "1259167896613945344": 2,
+        "1259181297088069632": 5,
+        "1259256320754724864": 8,
+        "1259887776887742464": 4,
+        "1259948124726628352": 6
+    },
+    "last_message_id": "1259142777103470592",
+    "last_message_time": 1754565541092,
+    "last_picked": null,
+    "league_id": "1259142774104526848",
+    "metadata": {
+        "description": "",
+        "name": "Prebens Premiership",
+        "scoring_type": "std"
+    },
+    "season": "2025",
+    "season_type": "regular",
+    "settings": {
+        "alpha_sort": 0,
+        "autopause_enabled": 0,
+        "autopause_end_time": 540,
+        "autopause_start_time": 1260,
+        "autostart": 0,
+        "cpu_autopick": 1,
+        "enforce_position_limits": 1,
+        "nomination_timer": 60,
+        "pick_timer": 120,
+        "player_type": 0,
+        "reversal_round": 0,
+        "rounds": 16,
+        "slots_bn": 5,
+        "slots_d": 3,
+        "slots_f": 2,
+        "slots_fm_flex": 1,
+        "slots_gk": 1,
+        "slots_m": 3,
+        "slots_md_flex": 1,
+        "teams": 8
+    },
+    "sport": "clubsoccer:epl",
+    "start_time": 1754937000000,
+    "status": "pre_draft",
+    "type": "snake"
+}
