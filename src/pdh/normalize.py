@@ -101,7 +101,7 @@ def normalize_player_matches(df: pd.DataFrame) -> pd.DataFrame:
     if "goals_conceded" in out.columns:
         out["clean_sheet"] = (
             (out["goals_conceded"] == 0) & (out["minutes"] >= 60)
-        ).astype(int)
+        ).astype(float)
 
     # per-90 for present stats
     m = out["minutes"].replace(0, np.nan)

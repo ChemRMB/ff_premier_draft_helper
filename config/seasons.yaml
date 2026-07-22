@@ -2,7 +2,7 @@
 #  is taken out due to no plays currently
 historical_seasons: [2022, 2023, 2024, 2025]  # last 3 completed seasons
 weights:
-  "2025": 2.0
+  "2025": 2.5
   "2024": 1.0
   "2023": 0.7
   "2022": 0.5

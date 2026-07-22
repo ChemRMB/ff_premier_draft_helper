@@ -47,7 +47,7 @@ args = ap.parse_args()
 # Paths & config
 # ---------------------------
 ROOT = Path(__file__).resolve().parents[1]
-OUTDIR = ROOT / "data" / "outputs"
+OUTDIR = ROOT / "data" / "season_2526" / "game_weeks"
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
 with open(ROOT / "config" / "seasons.yaml", "r") as fh:
@@ -69,17 +69,19 @@ roster_positions = sleeper_setup["roster_positions"]
 # Load data produced by other scripts
 # ---------------------------
 hist = pd.read_csv(
-    ROOT / "data" / "outputs" / "players_historical.csv"
+    ROOT / "data" / "historical" / "players_historical_20251025.csv"
 )  # from build_historical.py
+
+team_season_stats = pd.read_csv(
+    ROOT / "data" / "historical" / "teams_season_stats.csv"
+)  # from build_historical.py
+
 squads = pd.read_csv(
-    ROOT / "data" / "outputs" / "current_squads.csv"
+    ROOT / "data" / "season_2526" / "current_squads.csv"
 )  # from update_current.py
 fixtures = pd.read_csv(
-    ROOT / "data" / "outputs" / "fixtures.csv"
+    ROOT / "data" / "season_2526" / "fixtures.csv"
 )  # from update_current.py
-team_season_stats = pd.read_csv(
-    ROOT / "data" / "outputs" / "teams_season_stats.csv"
-)  # from build_historical.py
 
 
 # ---------------------------
@@ -732,31 +734,6 @@ den_def = tmpd.groupby("team")["_w"].sum()
 num_def = (tmpd["defense_idx_season"] * tmpd["_w"]).groupby(tmpd["team"]).sum()
 team_defense_hist = (num_def / den_def).rename("defense_idx_hist").reset_index()
 
-# --- Reconcile team names (aliases + fuzzy fallback) ---
-# team_names_fpl = squads[["team", "team_name"]].drop_duplicates()
-
-
-# def _keyize(s: pd.Series) -> pd.Series:
-#     return s.str.upper().str.replace(r"[^A-Z0-9]+", "", regex=True)
-
-
-# team_attack_hist["_name_for_key"] = team_attack_hist["team"].replace(ALIAS_FBREF_TO_FPL)
-# team_defense_hist["_name_for_key"] = team_defense_hist["team"].replace(
-#     ALIAS_FBREF_TO_FPL
-# )
-# team_attack_hist["_key"] = _keyize(team_attack_hist["_name_for_key"])
-# team_defense_hist["_key"] = _keyize(team_defense_hist["_name_for_key"])
-# team_names_fpl["_key"] = _keyize(team_names_fpl["team_name"])
-
-# team_power = (
-#     team_names_fpl.merge(
-#         team_attack_hist[["_key", "attack_idx_hist"]], on="_key", how="left"
-#     )
-#     .merge(team_defense_hist[["_key", "defense_idx_hist"]], on="_key", how="left")
-#     .drop(columns=["_key"])
-#     .drop_duplicates(subset=["team", "team_name"])
-# )
-# --- Reconcile team names (canonicalize to FPL first, then join; fuzzy as backup) ---
 
 # Canonicalize FBref names to FPL style up front
 fb_att = team_attack_hist.copy()
@@ -857,8 +834,8 @@ roster_tbl["points90w_sel"] = np.where(
         ),
     ),
 )
-ROSTER_TOP_N_ATT = 6
-ROSTER_TOP_N_DEF = 6
+ROSTER_TOP_N_ATT = 10
+ROSTER_TOP_N_DEF = 10
 roster_att = (
     roster_tbl[roster_tbl["pos"].isin(["F", "M"])]
     .dropna(subset=["team_name", "points90w_sel"])
@@ -900,25 +877,80 @@ def _norm_mean1(s: pd.Series) -> pd.Series:
     return (s / mu).replace([np.inf, -np.inf], 1.0).fillna(1.0)
 
 
-ALPHA_HIST = 0.6
-ALPHA_ROS = 0.4
+def _winsor_mean1_shrink(
+    s: pd.Series,
+    p_lo=0.10,
+    p_hi=0.90,
+    shrink=0.5,
+    final_clip: tuple[float, float] | None = (0.90, 1.10),
+) -> pd.Series:
+    """
+    Winsorize to [p_lo, p_hi] percentiles, normalize to mean=1, then shrink toward 1.
+    Optionally apply a light final clip.
+    """
+    x = pd.to_numeric(s, errors="coerce").copy()
+    lo = x.quantile(p_lo)
+    hi = x.quantile(p_hi)
+    x = x.clip(lo, hi)
+    mu = x.mean()
+    if not np.isfinite(mu) or mu == 0:
+        x = x.fillna(1.0)
+        mu = 1.0
+    x = x / mu  # mean ~ 1.0
+    x = 1.0 + shrink * (x - 1.0)  # shrink toward 1.0
+    if final_clip:
+        lo_c, hi_c = final_clip
+        x = x.clip(lo_c, hi_c)
+    return x.fillna(1.0)
+
+
+ALPHA_HIST = 0.2  # historical performance weight
+ALPHA_ROS = 0.8  # current roster strength weight
+
 team_power["attack_hist_n"] = _norm_mean1(team_power["attack_idx_hist"])
 team_power["roster_att_n"] = _norm_mean1(team_power["roster_att"])
 team_power["defense_hist_n"] = _norm_mean1(team_power["defense_idx_hist"])
 team_power["roster_def_n"] = _norm_mean1(team_power["roster_def"])
 
 
-def _clamp_norm(s, lo=0.85, hi=1.15):
-    x = s.clip(lo, hi)
-    return _norm_mean1(x)
+# 1) Normalize inputs to be ~mean=1
+for c in ["attack_idx_hist", "defense_idx_hist", "roster_att", "roster_def"]:
+    team_power[c] = pd.to_numeric(team_power[c], errors="coerce")
 
+att_hist_n = _norm_mean1(team_power["attack_idx_hist"]).fillna(1.0)
+ros_att_n = _norm_mean1(team_power["roster_att"]).fillna(1.0)
+def_hist_n = _norm_mean1(team_power["defense_idx_hist"]).fillna(1.0)
+ros_def_n = _norm_mean1(team_power["roster_def"]).fillna(1.0)
 
-team_power["attack_power"] = _clamp_norm(
-    ALPHA_HIST * team_power["attack_hist_n"] + ALPHA_ROS * team_power["roster_att_n"]
-)
-team_power["defense_power"] = _clamp_norm(
-    ALPHA_HIST * team_power["defense_hist_n"] + ALPHA_ROS * team_power["roster_def_n"]
-)
+# 2) Blend
+att_blend = ALPHA_HIST * att_hist_n + ALPHA_ROS * ros_att_n
+def_blend = ALPHA_HIST * def_hist_n + ALPHA_ROS * ros_def_n
+
+team_power["attack_power"] = att_blend
+team_power["defense_power"] = def_blend
+
+# 3) Winsorize + mean-1 + shrink (no edge pinning)
+# team_power["attack_power"] = _winsor_mean1_shrink(
+#     att_blend,
+#     p_lo=0.10,
+#     p_hi=0.90,
+#     shrink=0.6,  # final_clip=(0.92, 1.08)
+# )
+# team_power["defense_power"] = _winsor_mean1_shrink(
+#     def_blend,
+#     p_lo=0.10,
+#     p_hi=0.90,
+#     shrink=0.6,  # final_clip=(0.92, 1.08)
+# )
+for label, col in [
+    ("attack_power", "attack_power"),
+    ("defense_power", "defense_power"),
+]:
+    x = team_power[col]
+    print(
+        f"[dbg] {label}: min={x.min():.3f}, p10={x.quantile(0.10):.3f}, "
+        f"median={x.median():.3f}, p90={x.quantile(0.90):.3f}, max={x.max():.3f}, mean={x.mean():.3f}"
+    )
 
 dbg_missing = team_power[
     team_power["attack_idx_hist"].isna() | team_power["defense_idx_hist"].isna()
@@ -1051,7 +1083,7 @@ def exp_minutes(row):
     status = str(row.get("status", "")).lower()
     sm = STATUS_MULT.get(status, 0.80 if status == "" else 0.0)
     cp = row.get(chance_field, np.nan)
-    cm = float(cp) / 100.0 if pd.notna(cp) else 1.0
+    cm = float(cp) / 100.0 if pd.notna(cp) else 0.50
     est = base * sm * cm
     return float(max(0.0, min(90.0, est)))
 
@@ -1258,13 +1290,8 @@ print(f"Wrote {OUTDIR_GW / 'draft_board_flexaware.csv'}")
 
 
 # ---------------------------
-# 9) Snake draft planner (stateful)
+# 9) Top roster planner (stateful, no simulation)
 # ---------------------------
-def snake_round_order(teams: int, round_num: int) -> list[int]:
-    base = list(range(1, teams + 1))
-    return base if (round_num % 2 == 1) else list(reversed(base))
-
-
 def roster_requirements(positions: list[str]) -> dict[str, int]:
     req = {"F": 0, "M": 0, "D": 0, "GK": 0, "FM_FLEX": 0, "MD_FLEX": 0, "BN": 0}
     for p in positions:
@@ -1284,15 +1311,12 @@ def starters_remaining(req: dict[str, int]) -> int:
 
 
 def can_assign(pos: str, req: dict[str, int]) -> tuple[bool, str]:
-    # Try direct positional slot
     if req.get(pos, 0) > 0:
         return True, pos
-    # FLEX logic
     if pos in FLEX_MAP["FM_FLEX"] and req.get("FM_FLEX", 0) > 0:
         return True, "FM_FLEX"
     if pos in FLEX_MAP["MD_FLEX"] and req.get("MD_FLEX", 0) > 0:
         return True, "MD_FLEX"
-    # Bench only after all starters filled
     if req.get("BN", 0) > 0 and starters_remaining(req) == 0:
         return True, "BN"
     return False, ""
@@ -1302,20 +1326,9 @@ def assign_slot(req: dict[str, int], slot: str):
     req[slot] = max(0, req.get(slot, 0) - 1)
 
 
-draft_order = sleeper_draft.get("draft_order", {})
-my_team_id = (
-    args.my_team_id
-    or sleeper_setup.get("my_team_id")
-    or next(iter(draft_order.keys()), None)
-)
-if my_team_id in draft_order:
-    my_slot = int(draft_order[my_team_id])
-else:
-    my_slot = teams_in_league  # fallback: last pick
-
-num_rounds = len(roster_positions)
-
-# Base board
+# Build the candidate pool from the flex-aware board.
+# We do NOT simulate other teams' picks anymore. We only remove players that are
+# already unavailable via taken.csv and players already on my snake_state.csv.
 board_base = (
     players[players["pos"].isin(["F", "M", "D", "GK"])][
         ["web_name", "pos", "team_name", "proj_points", "proj_nextN", "team"]
@@ -1324,7 +1337,6 @@ board_base = (
     .copy()
 )
 
-# Replacement ranks
 repl_flex = effective_replacement_ranks_with_flex(
     board_base,
     pos_col="pos",
@@ -1334,7 +1346,6 @@ repl_flex = effective_replacement_ranks_with_flex(
 )
 draft_board_flex = build_vor(board_base, repl_flex)
 
-# Merge nextN for convenience
 if "proj_nextN" in board_base.columns:
     name_nextN = board_base[["web_name", "proj_nextN"]].drop_duplicates(
         subset=["web_name"]
@@ -1342,10 +1353,12 @@ if "proj_nextN" in board_base.columns:
     avail = draft_board_flex.merge(name_nextN, on="web_name", how="left")
 else:
     avail = draft_board_flex.copy()
+
 if "proj_nextN" not in avail.columns:
     avail["proj_nextN"] = avail["proj_points"]
 else:
     avail["proj_nextN"] = avail["proj_nextN"].fillna(avail["proj_points"])
+
 avail = (
     avail[
         [
@@ -1363,31 +1376,30 @@ avail = (
     .reset_index(drop=True)
 )
 
-# Remove globally taken names
-taken_names = read_taken_csv(OUTDIR_GW)
-if taken_names:
+# Remove globally unavailable players from taken.csv
+players_taken = read_taken_csv(OUTDIR_GW)
+if players_taken:
     avail = avail[
-        ~avail["web_name"].str.lower().isin([n.lower() for n in taken_names])
+        ~avail["web_name"].str.lower().isin([n.lower() for n in players_taken])
     ].reset_index(drop=True)
 
-# Load my current state (already picked players + their slots)
+# Load my current state (already picked players and the slot they used)
 my_state = read_snake_state(OUTDIR_GW)
 
-# Also remove my previously picked players from the pool
+# Remove my already-picked players from the candidate pool
 if len(my_state):
     avail = avail[
         ~avail["web_name"].str.lower().isin(my_state["web_name"].str.lower())
     ].reset_index(drop=True)
 
-# Determine remaining requirements after applying my picked slots
+# Remaining roster requirements after applying my already picked players
 req = roster_requirements(roster_positions)
 if len(my_state) and my_state["slot_used"].notna().any():
     req = subtract_used_slots(req, my_state["slot_used"].dropna())
 
-# If some of my prior picks are missing slot_used, try to infer slots now to keep req consistent
+# If some prior picks are missing slot_used, infer them conservatively
 missing_slot_mask = my_state["slot_used"].isna()
 if missing_slot_mask.any():
-    # Build a quick lookup from avail+players (to get positions)
     pos_lookup = players.set_index("web_name")["pos"].to_dict()
     for i, row in my_state[missing_slot_mask].iterrows():
         wn = row["web_name"]
@@ -1398,82 +1410,45 @@ if missing_slot_mask.any():
                 assign_slot(req, which)
                 my_state.at[i, "slot_used"] = which
 
-# Figure out where to start (next round)
-picked_rounds = my_state["my_round"].dropna()
-if len(picked_rounds):
-    start_round = int(picked_rounds.max()) + 1
-else:
-    start_round = len(my_state) + 1  # fallback if my_rounds not provided
+# Build the best remaining roster greedily:
+# - while starters remain: prioritize VOR, then proj_points
+# - after starters are full (bench only): prioritize proj_nextN, then VOR
+remaining_picks = []
+while any(v > 0 for v in req.values()):
+    if avail.empty:
+        break
 
-# Build plan from start_round → num_rounds
-my_picks_new = []
-
-
-def pop_best_available(av: pd.DataFrame) -> pd.Series | None:
-    return av.iloc[0] if len(av) else None
-
-
-def remove_player(av: pd.DataFrame, name: str) -> pd.DataFrame:
-    return av[av["web_name"].str.lower() != name.lower()].reset_index(drop=True)
-
-
-for rnd in range(start_round, num_rounds + 1):
-    order = snake_round_order(teams_in_league, rnd)
-    for slot in order:
-        if slot == my_slot:
-            pick = None
-            av = avail.copy()
-            # Starters first, then bench
-            if starters_remaining(req) > 0:
-                for _, row in av.sort_values(
-                    ["VOR", "proj_points"], ascending=False
-                ).iterrows():
-                    ok, which = can_assign(row["pos"], req)
-                    if ok:
-                        pick = row.copy()
-                        pick["slot_used"] = which
-                        assign_slot(req, which)
-                        break
-            else:
-                for _, row in av.sort_values(
-                    ["proj_nextN", "VOR"], ascending=False
-                ).iterrows():
-                    ok, which = can_assign(row["pos"], req)
-                    if ok:
-                        pick = row.copy()
-                        pick["slot_used"] = which
-                        assign_slot(req, which)
-                        break
-            if pick is None:
-                row = pop_best_available(av)
-                if row is None:
-                    continue
+    pick = None
+    if starters_remaining(req) > 0:
+        for _, row in avail.sort_values(
+            ["VOR", "proj_points"], ascending=False
+        ).iterrows():
+            ok, which = can_assign(row["pos"], req)
+            if ok:
                 pick = row.copy()
-                pick["slot_used"] = "BN" if starters_remaining(req) == 0 else "ANY"
-                if pick["slot_used"] == "BN":
-                    assign_slot(req, "BN")
+                pick["slot_used"] = which
+                assign_slot(req, which)
+                break
+    else:
+        for _, row in avail.sort_values(
+            ["proj_nextN", "VOR"], ascending=False
+        ).iterrows():
+            ok, which = can_assign(row["pos"], req)
+            if ok:
+                pick = row.copy()
+                pick["slot_used"] = which
+                assign_slot(req, which)
+                break
 
-            pick["my_round"] = rnd
-            overall = (rnd - 1) * teams_in_league + (order.index(slot) + 1)
-            pick["overall_pick"] = overall
-            my_picks_new.append(pick)
-            avail = remove_player(avail, pick["web_name"])
-        else:
-            row = pop_best_available(
-                avail.sort_values(["VOR", "proj_points"], ascending=False)
-            )
-            if row is not None:
-                avail = remove_player(avail, row["web_name"])
+    if pick is None:
+        break
 
+    remaining_picks.append(pick)
+    avail = avail[
+        avail["web_name"].str.lower() != str(pick["web_name"]).lower()
+    ].reset_index(drop=True)
 
-# Combine previously picked + new plan
-def overall_from_round(rnd: float, my_slot: int, teams: int) -> float:
-    if pd.isna(rnd):
-        return np.nan
-    rnd = int(rnd)
-    return (rnd - 1) * teams + (my_slot if (rnd % 2 == 1) else (teams - my_slot + 1))
-
-
+# Enrich already-picked rows so the output is a complete current best roster view
 already = pd.DataFrame(
     columns=[
         "web_name",
@@ -1485,61 +1460,105 @@ already = pd.DataFrame(
         "VOR",
         "proj_nextN",
         "slot_used",
-        "my_round",
-        "overall_pick",
     ]
 )
 if len(my_state):
-    # enrich my_state rows with projections so the view is informative
-    enrich = players[["web_name", "pos", "team_name"]].drop_duplicates()
+    enrich = players[
+        [
+            "web_name",
+            "pos",
+            "team_name",
+            "proj_points",
+            "proj_nextN",
+        ]
+    ].drop_duplicates(subset=["web_name"])
     already = my_state.merge(enrich, on="web_name", how="left")
-    already["proj_points"] = np.nan
-    already["replacement_at_rank"] = np.nan
-    already["replacement_points"] = np.nan
-    already["VOR"] = np.nan
-    already["proj_nextN"] = np.nan
-    already["overall_pick"] = already.apply(
-        lambda r: overall_from_round(r["my_round"], my_slot, teams_in_league), axis=1
-    )
+    # bring VOR/replacement context from the current flex-aware board if available
+    enrich_vor = draft_board_flex[
+        [
+            "web_name",
+            "replacement_at_rank",
+            "replacement_points",
+            "VOR",
+        ]
+    ].drop_duplicates(subset=["web_name"])
+    already = already.merge(enrich_vor, on="web_name", how="left")
+    already["already_picked"] = True
 
 new_df = (
-    pd.DataFrame(my_picks_new)
-    if len(my_picks_new)
+    pd.DataFrame(remaining_picks)
+    if len(remaining_picks)
     else pd.DataFrame(columns=already.columns)
 )
+if len(new_df):
+    new_df["already_picked"] = False
 
-plan = pd.concat(
-    [already.assign(already_picked=True), new_df.assign(already_picked=False)],
-    ignore_index=True,
-)
+plan = pd.concat([already, new_df], ignore_index=True, sort=False)
+
+# Order the roster in a human-friendly way: starters before bench, then by projected strength
+slot_order = {
+    "GK": 0,
+    "F": 1,
+    "M": 2,
+    "D": 3,
+    "FM_FLEX": 4,
+    "MD_FLEX": 5,
+    "BN": 6,
+}
+plan["slot_order"] = plan["slot_used"].map(slot_order).fillna(99)
 plan = plan.sort_values(
-    ["already_picked", "my_round", "overall_pick"], ascending=[False, True, True]
+    ["slot_order", "already_picked", "proj_points", "proj_nextN", "VOR"],
+    ascending=[True, False, False, False, False],
 ).reset_index(drop=True)
 
-# Save plan + next state + taken_next
-plan_out = OUTDIR_GW / "snake_plan.csv"
+# Save outputs
+plan_out = OUTDIR_GW / "top_roster.csv"
 plan.to_csv(plan_out, index=False)
 print(f"Wrote {plan_out}")
 
-# Next state proposal: prior state + newly suggested picks
-next_state_path = write_snake_state_next(
-    OUTDIR_GW, my_state, plan[plan["already_picked"] == False]
-)
+# Also overwrite snake_plan.csv with the same content for backwards compatibility
+snake_out = OUTDIR_GW / "snake_plan.csv"
+plan.to_csv(snake_out, index=False)
+print(f"Wrote {snake_out}")
+
+# Write next-state suggestion: already picked + newly recommended picks
+next_state_df = pd.concat(
+    [
+        (
+            my_state[["web_name", "slot_used", "my_round"]]
+            if len(my_state)
+            else pd.DataFrame(columns=["web_name", "slot_used", "my_round"])
+        ),
+        (
+            new_df.assign(my_round=np.nan)[["web_name", "slot_used", "my_round"]]
+            if len(new_df)
+            else pd.DataFrame(columns=["web_name", "slot_used", "my_round"])
+        ),
+    ],
+    ignore_index=True,
+).drop_duplicates(subset=["web_name"], keep="last")
+next_state_path = OUTDIR_GW / "snake_state_next.csv"
+next_state_df.to_csv(next_state_path, index=False)
 print(
     f"Wrote {next_state_path}  (rename to {OUTDIR_GW/'snake_state.csv'} for the next run)"
 )
 
-# Update taken_next so you can use it for subsequent runs too
-taken_all = set([n.lower() for n in read_taken_csv(OUTDIR_GW)]) | set(
-    plan["web_name"].str.lower()
+# Write taken_next.csv = current taken + players already picked by me + newly recommended roster additions
+current_taken = set(n.lower() for n in players_taken)
+my_existing = (
+    set(my_state["web_name"].astype(str).str.lower()) if len(my_state) else set()
 )
-pd.DataFrame(
-    {"web_name": sorted({w for w in plan["web_name"] if isinstance(w, str)})}
-).to_csv(OUTDIR_GW / "taken_next.csv", index=False)
-print(f"Wrote {OUTDIR_GW / 'taken_next.csv'}  (rename to taken.csv when appropriate)")
-print(f"Wrote {OUTDIR_GW / 'top10.csv'}")
-print(f"Wrote {OUTDIR_GW / 'draft_board_nonflex.csv'}")
-print(f"Wrote {OUTDIR_GW / 'draft_board_flexaware.csv'}")
+my_new = set(new_df["web_name"].astype(str).str.lower()) if len(new_df) else set()
+all_taken = current_taken | my_existing | my_new
+
+# Preserve original casing by sourcing from the plan rows
+name_map = {str(n).lower(): str(n) for n in plan["web_name"].dropna().tolist()}
+taken_next_df = pd.DataFrame(
+    {"web_name": [name_map.get(k, k) for k in sorted(all_taken)]}
+)
+taken_next_path = OUTDIR_GW / "taken_next.csv"
+taken_next_df.to_csv(taken_next_path, index=False)
+print(f"Wrote {taken_next_path}  (rename to {OUTDIR_GW/'taken.csv'} when appropriate)")
 
 # ---- tiny mapping log ----
 unmatched = name_link[name_link["player_fbref"].isna()]
