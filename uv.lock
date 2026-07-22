@@ -191,12 +191,13 @@ wheels = [
 [[package]]
 name = "ff-premier-draft-helper"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "numpy" },
     { name = "pandas" },
     { name = "pyyaml" },
     { name = "requests" },
+    { name = "seleniumbase" },
     { name = "soccerdata" },
 ]
 
@@ -206,6 +207,7 @@ requires-dist = [
     { name = "pandas", specifier = ">=2.3.2" },
     { name = "pyyaml", specifier = ">=6.0.2" },
     { name = "requests", specifier = ">=2.32.5" },
+    { name = "seleniumbase", specifier = ">=4.35.0" },
     { name = "soccerdata", specifier = ">=1.9.0" },
 ]
 

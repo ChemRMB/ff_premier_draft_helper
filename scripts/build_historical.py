@@ -4,8 +4,8 @@ Pull last 3 seasons of team & player data via soccerdata (FBref) and write CSVs.
 
 import pandas as pd, yaml
 from pathlib import Path
-from src.pdh.fbref import player_match_stats, team_season_stats
-from src.pdh.normalize import normalize_player_matches
+from pdh.fbref import player_match_stats, team_season_stats
+from pdh.normalize import normalize_player_matches
 from datetime import datetime
 import yaml
 

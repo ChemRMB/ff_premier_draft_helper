@@ -13,8 +13,8 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from src.pdh.scoring import load_sleeper_scoring, load_stat_map, points_from_row
-from src.pdh import fpl  # used to fetch FPL team ids if missing
+from pdh.scoring import load_sleeper_scoring, load_stat_map, points_from_row
+from pdh import fpl  # used to fetch FPL team ids if missing
 
 
 # ---------------------------

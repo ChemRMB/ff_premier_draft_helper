@@ -4,9 +4,9 @@ Fetch current squads and fixtures from FPL
 
 import pandas as pd, yaml, json
 from pathlib import Path
-from src.pdh import fpl
-from src.pdh.fbref import schedule, flatten_cols
-from src.pdh.sleeper import (
+from pdh import fpl
+from pdh.fbref import schedule, flatten_cols
+from pdh.sleeper import (
     get_sleeper_rosters,
     get_sleeper_players,
     get_players_by_team,
