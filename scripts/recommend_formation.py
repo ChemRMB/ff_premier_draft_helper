@@ -2,7 +2,7 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 
-from src.pdh.sleeper import (
+from pdh.sleeper import (
     get_sleeper_rosters,
     get_sleeper_players,
     get_my_team_players,

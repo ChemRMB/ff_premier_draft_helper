@@ -1,35 +1,40 @@
 # Premier Draft Helper (PL + Sleeper)
 
 A Python scaffold to build a draft and weekly recommender for your Sleeper Premier League league.
-It combines **FPL public API** (current squads, fixtures) with **soccerdata** (FBref/FotMob) for historical player & team performance, and projects points using your **Sleeper** scoring and roster configuration.
+It combines **FPL public API** (current squads, fixtures) with **soccerdata** (FBref for broad per-90 stats, Understat for player-level xG/xA) for historical player & team performance, and projects points using your **Sleeper** scoring and roster configuration.
+FotMob was previously listed as a source here, but soccerdata removed its FotMob reader entirely as of 1.9.0 - it's not usable via this library. See `config/scraper_comparison.md` for the full source comparison and decision.
 
 ## Quick start
 
 ```bash
-python -m venv .venv && source .venv/bin/activate  # or .venv\Scripts\activate on Windows
-pip install -r requirements.txt
+uv sync  # creates .venv from pyproject.toml/uv.lock
 
-# One-time: place your Sleeper files in ./config/ (or keep the samples)
-# Then fetch & cache data + build draft board for GW1 (edit arguments inside the script as needed):
-python scripts/build_historical.py
-python scripts/update_current.py
-python scripts/make_recommendations.py
+# One-time: refresh config/sleeper_setup.json + sleeper_draft.json from the live Sleeper API
+uv run python scripts/refresh_league_config.py
+
+# Fetch & cache data + build draft board for GW1 (edit arguments inside the script as needed):
+uv run python scripts/build_historical.py
+uv run python scripts/update_current.py
+uv run python scripts/make_recommendations.py
 ```
 
 ## What you get
 
 - `src/pdh/fpl.py` – FPL endpoints: bootstrap (players/teams/events), fixtures, per-player history.
-- `src/pdh/fbref.py` – soccerdata FBref access: team & player match logs per season.
+- `src/pdh/fbref.py` – soccerdata FBref access: team & player match logs per season (broad per-90 stats, no xG/xA).
+- `src/pdh/understat.py` – soccerdata Understat access: player-level xG/xA/np_xG/xG-chain/xG-buildup.
+- `src/pdh/sleeper.py` – Sleeper API access: rosters, players (weekly-cached), league/draft config refresh.
+- `src/pdh/namelink.py` – shared canonical-name + fuzzy + curated-CSV player-name matching, used by both Sleeper<->FPL and FPL<->FBref linking.
 - `src/pdh/normalize.py` – standardize player stats (per-90, tidy columns, join across tables).
 - `src/pdh/scoring.py` – loads Sleeper scoring, maps stat names (editable in `config/stat_map.yaml`), computes fantasy points.
 - `src/pdh/recommend.py` – season-weighted player rates, fixture difficulty adjustment, GW projections.
 - `src/pdh/draft_board.py` – VOR (value over replacement) ranks by position given your snake-draft roster settings.
-- `scripts/*.py` – runnable examples that write CSVs to `./data/outputs/`.
+- `scripts/*.py` – runnable pipeline: `refresh_league_config.py`, `compare_scrapers.py`, `build_historical.py`, `update_current.py`, `make_recommendations.py`, `recommend_formation.py`.
 
 ## Configure
 
-- `config/sleeper_setup.json` and `config/sleeper_draft.json` – your league settings (samples included from your uploads).
-- `config/stat_map.yaml` – edit this to align Sleeper’s stat keys with available FBref/FotMob fields.
+- `config/sleeper_setup.json` and `config/sleeper_draft.json` – your league settings, regenerated from the live Sleeper API via `scripts/refresh_league_config.py` (don't hand-edit; re-run the script instead, e.g. again after the draft happens).
+- `config/stat_map.yaml` – edit this to align Sleeper’s stat keys with available FBref/Understat fields.
 - `config/seasons.yaml` – choose historical seasons and weighting (e.g., 2025: 1.5, 2024: 1.25, 2023: 1.0).
 
 ## Data outputs
@@ -42,4 +47,4 @@ python scripts/make_recommendations.py
 
 ## Licenses & ToS
 
-Respect the terms of use for FPL, FBref, FotMob, and other sites. Unofficial endpoints may change.
+Respect the terms of use for FPL, FBref, Understat, and other sites. Unofficial endpoints may change.

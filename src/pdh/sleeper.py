@@ -1,14 +1,125 @@
-import requests
-import pandas as pd
+import json
+from datetime import datetime, timedelta
 from pathlib import Path
-from datetime import datetime
-import re, unicodedata
 
+import pandas as pd
+import requests
+
+from pdh.namelink import apply_curated_overrides, canonical_name, link_names
 
 # https://docs.sleeper.com/
+# NOTE: docs.sleeper.com only documents NFL. Club-soccer usage below
+# (sport="clubsoccer:epl") works empirically but is otherwise undocumented -
+# endpoint semantics (e.g. week/round numbering) should not be assumed to match
+# the NFL docs without verifying against real responses.
+
+ROOT = Path(__file__).resolve().parents[2]
+CONFIG_DIR = ROOT / "config"
+SLEEPER_SETUP_PATH = CONFIG_DIR / "sleeper_setup.json"
+SLEEPER_DRAFT_PATH = CONFIG_DIR / "sleeper_draft.json"
+SLEEPER_NAME_CURATED_PATH = CONFIG_DIR / "name_link_sleeper_curated.csv"
+SLEEPER_CACHE_DIR = ROOT / "data" / "cache" / "sleeper"
+
+# Seed ids used only to bootstrap refresh_league_config() before
+# config/sleeper_setup.json exists/matches the current league. Once refreshed,
+# LEAGUE_ID/MY_TEAM_ID below are read from that file instead, so this pair only
+# needs updating again if we ever join a genuinely different league.
+_SEED_LEAGUE_ID = "1385257445575639040"
+_SEED_MY_TEAM_ID = "1259256320754724864"
+
+
+def _load_league_ids() -> tuple[str, str]:
+    if SLEEPER_SETUP_PATH.exists():
+        try:
+            cfg = json.loads(SLEEPER_SETUP_PATH.read_text())
+            return (
+                cfg.get("league_id") or _SEED_LEAGUE_ID,
+                cfg.get("my_team_id") or _SEED_MY_TEAM_ID,
+            )
+        except (json.JSONDecodeError, OSError):
+            pass
+    return _SEED_LEAGUE_ID, _SEED_MY_TEAM_ID
+
+
+LEAGUE_ID, MY_TEAM_ID = _load_league_ids()
 CURRENT_WEEK = datetime.now().isocalendar()[1]
-LEAGUE_ID = "1259142774104526848"
-MY_TEAM_ID = "1259256320754724864"
+
+
+def get_league_info(league_id: str = LEAGUE_ID) -> dict:
+    """Fetch league settings/scoring from the Sleeper API."""
+    url = f"https://api.sleeper.app/v1/league/{league_id}"
+    response = requests.get(url)
+    response.raise_for_status()
+    return response.json()
+
+
+def get_league_users(league_id: str = LEAGUE_ID) -> list[dict]:
+    """Fetch league members (owners) from the Sleeper API."""
+    url = f"https://api.sleeper.app/v1/league/{league_id}/users"
+    response = requests.get(url)
+    response.raise_for_status()
+    return response.json()
+
+
+def get_league_drafts(league_id: str = LEAGUE_ID) -> list[dict]:
+    """Fetch all drafts associated with a league from the Sleeper API."""
+    url = f"https://api.sleeper.app/v1/league/{league_id}/drafts"
+    response = requests.get(url)
+    response.raise_for_status()
+    return response.json()
+
+
+def refresh_league_config(
+    league_id: str,
+    my_team_id: str,
+    setup_path: Path = SLEEPER_SETUP_PATH,
+    draft_path: Path = SLEEPER_DRAFT_PATH,
+) -> tuple[dict, dict]:
+    """
+    Refresh config/sleeper_setup.json and config/sleeper_draft.json from the live
+    Sleeper API, so downstream code (VOR, scoring, snake-draft planner) never
+    relies on stale/hand-edited league settings (team count, roster_positions,
+    scoring, draft order).
+
+    Safe to re-run. The league sits in "pre_draft" status until the draft
+    happens, at which point roster_positions/draft_order/scoring can change -
+    re-run this after the draft to pick that up.
+    """
+    league = get_league_info(league_id)
+
+    users = get_league_users(league_id)
+    user_ids = {u["user_id"] for u in users}
+    if my_team_id not in user_ids:
+        raise ValueError(
+            f"my_team_id {my_team_id!r} is not a member of league {league_id!r}. "
+            f"League members: {sorted(user_ids)}"
+        )
+
+    setup = dict(league)
+    setup["my_team_id"] = my_team_id
+    setup_path.parent.mkdir(parents=True, exist_ok=True)
+    setup_path.write_text(json.dumps(setup, indent=4) + "\n")
+
+    drafts = get_league_drafts(league_id)
+    draft = next(
+        (d for d in drafts if d.get("draft_id") == league.get("draft_id")),
+        drafts[0] if drafts else None,
+    )
+    if draft is None:
+        raise ValueError(f"No drafts found for league {league_id!r}")
+    draft_path.parent.mkdir(parents=True, exist_ok=True)
+    draft_path.write_text(json.dumps(draft, indent=4) + "\n")
+
+    print(
+        f"Refreshed {setup_path.name}/{draft_path.name} for '{league.get('name')}' "
+        f"(status={league.get('status')}, total_rosters={league.get('total_rosters')})"
+    )
+    if draft.get("draft_order") is None:
+        print(
+            "Note: draft_order is not set yet (league is still pre-draft) - "
+            "re-run this once the commissioner randomizes the draft order."
+        )
+    return setup, draft
 
 
 def get_sleeper_rosters(league_id=LEAGUE_ID):
@@ -20,38 +131,55 @@ def get_sleeper_rosters(league_id=LEAGUE_ID):
     return pd.DataFrame(rosters)
 
 
-def get_sleeper_players(leage: str = "clubsoccer:epl"):
-    """Fetch EPL players from Sleeper API and return as DataFrame."""
-    url = f"https://api.sleeper.app/v1/players/{leage}"
+def get_sleeper_players(
+    league: str = "clubsoccer:epl",
+    max_age_days: int = 7,
+    force_refresh: bool = False,
+) -> pd.DataFrame:
+    """
+    Fetch EPL players from Sleeper API and return as DataFrame.
+
+    Cached on disk for up to `max_age_days` (default weekly) so we don't spam
+    this ~5MB endpoint on every call.
+    """
+    cache_path = SLEEPER_CACHE_DIR / f"players_{league.replace(':', '_')}.json"
+
+    if not force_refresh and cache_path.exists():
+        age = datetime.now() - datetime.fromtimestamp(cache_path.stat().st_mtime)
+        if age < timedelta(days=max_age_days):
+            players = json.loads(cache_path.read_text())
+            return pd.DataFrame(players).T
+
+    url = f"https://api.sleeper.app/v1/players/{league}"
     response = requests.get(url)
     response.raise_for_status()  # Raise an error for bad responses
     players = response.json()
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(players))
+
     return pd.DataFrame(players).T
 
 
-def get_players_by_team(rosters_df, players_df):
+def get_players_by_team(rosters_df, players_df, my_team_id=MY_TEAM_ID):
     """Map players to their respective teams based on rosters."""
     team_players = {}
-    for _, row in rosters_df[rosters_df["owner_id"] != MY_TEAM_ID].iterrows():
+    for _, row in rosters_df[rosters_df["owner_id"] != my_team_id].iterrows():
         team_id = row["owner_id"]
         player_ids = row["players"]
         team_players[team_id] = players_df[players_df["player_id"].isin(player_ids)]
     return team_players
 
 
-def get_my_team_players(rosters_df, players_df):
+def get_my_team_players(rosters_df, players_df, my_team_id=MY_TEAM_ID):
     """Get players for my own team based on rosters."""
-    my_team_row = rosters_df[rosters_df["owner_id"] == MY_TEAM_ID]
-    print("my_team_row:")
-    print(my_team_row)
+    my_team_row = rosters_df[rosters_df["owner_id"] == my_team_id]
     if my_team_row.empty:
-        raise ValueError(f"No roster found for team ID {MY_TEAM_ID}")
+        raise ValueError(f"No roster found for team ID {my_team_id}")
     player_ids = my_team_row.iloc[0]["players"]
-    print("player_ids:", player_ids)
     my_players = players_df[players_df["player_id"].isin(player_ids)]
     if my_players.empty:
         player_ids = [int(pid) for pid in player_ids]
-        print("Converted player_ids to int:", player_ids)
         my_players = players_df[players_df["player_id"].isin(player_ids)]
     return my_players
 
@@ -63,106 +191,86 @@ def get_positions(players_df):
     return positions
 
 
-def norm(s):
-    if pd.isna(s):
-        return ""
-    s = str(s)
-    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
-    s = s.lower()
-    s = re.sub(r"[\"'`]", "", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
 def normalize_squad_df(squad_df):
     """Ensure normalized columns on squad_df."""
     squad_df = squad_df.copy()
     if "web_name_n" not in squad_df.columns:
-        squad_df["web_name_n"] = squad_df["web_name"].map(norm)
+        squad_df["web_name_n"] = squad_df["web_name"].map(canonical_name)
     if "first_name_n" not in squad_df.columns:
-        squad_df["first_name_n"] = squad_df["first_name"].map(norm)
+        squad_df["first_name_n"] = squad_df["first_name"].map(canonical_name)
     if "second_name" in squad_df.columns and "second_name_n" not in squad_df.columns:
-        squad_df["second_name_n"] = squad_df["second_name"].map(norm)
+        squad_df["second_name_n"] = squad_df["second_name"].map(canonical_name)
     elif "second_name_n" not in squad_df.columns:
         squad_df["second_name_n"] = pd.Series(
             [""] * len(squad_df), index=squad_df.index
         )
     # normalized team code for reliable team filtering
     if "team_code" in squad_df.columns and "team_code_n" not in squad_df.columns:
-        squad_df["team_code_n"] = squad_df["team_code"].map(norm)
+        squad_df["team_code_n"] = squad_df["team_code"].map(canonical_name)
     elif "team_code_n" not in squad_df.columns:
         squad_df["team_code_n"] = pd.Series([""] * len(squad_df), index=squad_df.index)
     return squad_df
 
 
-def get_sleeper_name_to_web_name(df_team_players, squad_df_normalized):
+def get_sleeper_name_to_web_name(df_team_players, squad_df_normalized, cutoff: float = 0.90):
+    """
+    Match each Sleeper roster row to its FPL `web_name`.
 
-    lst_taken = []
-    for _, row in df_team_players.iterrows():
-        last_n = norm(row.get("last_name", ""))
-        first_n = norm(row.get("first_name", ""))
-        full_n = norm(row.get("full_name", ""))
-        team_n = norm(row.get("team_abbr", ""))
-        # restrict to same team if possible
-        if team_n:
-            df_team = squad_df_normalized[squad_df_normalized["team_code_n"] == team_n]
-            if df_team.empty:
-                # fallback to whole dataset if team not found
-                df_team = squad_df_normalized
-                team_note = "(team not found, searching all teams)"
-            else:
-                team_note = f"(team match {team_n})"
-        else:
-            df_team = squad_df_normalized
-            team_note = "(no team_abbr, searching all teams)"
+    FPL's `web_name` is often an abbreviated display name (e.g. "M.Salah", or
+    just a surname), not a full name - matching against it directly fails even
+    for exact matches. So we match on FPL's unabbreviated `first_name`+
+    `second_name` (same approach as the proven FPL<->FBref linker in
+    scripts/make_recommendations.py, generalized in src/pdh/namelink.py) and
+    only resolve to `web_name` once a match is found. Curated overrides (if
+    any) live in config/name_link_sleeper_curated.csv with columns
+    `full_name`, `matched_name` (the desired web_name).
+    """
+    if df_team_players.empty:
+        return []
 
-        found = None
-        reason = None
+    src = df_team_players.copy()
+    if "full_name" not in src.columns or src["full_name"].isna().all():
+        src["full_name"] = (
+            src.get("first_name", pd.Series(dtype=str)).fillna("")
+            + " "
+            + src.get("last_name", pd.Series(dtype=str)).fillna("")
+        ).str.strip()
 
-        # 1) exact web_name match (preferred)
-        m = df_team[df_team["web_name_n"] == last_n]
-        if not m.empty:
-            found = m["web_name"].iloc[0]
-            reason = "web_name exact match"
-        else:
-            # 2) web_name contains last name
-            if last_n:
-                m = df_team[
-                    df_team["web_name_n"].str.contains(re.escape(last_n), na=False)
-                ]
-                if not m.empty:
-                    found = m["web_name"].iloc[0]
-                    reason = "web_name contains last name"
-            # 3) first_name contains player's first name / nickname
-            if not found and first_n:
-                m = df_team[
-                    df_team["first_name_n"].str.contains(re.escape(first_n), na=False)
-                ]
-                if not m.empty:
-                    found = m["web_name"].iloc[0]
-                    reason = "first_name contains first/nickname"
-            # 4) try tokens from full_name against web_name
-            if not found and full_n:
-                for token in full_n.split():
-                    if not token:
-                        continue
-                    m = df_team[
-                        df_team["web_name_n"].str.contains(re.escape(token), na=False)
-                    ]
-                    if not m.empty:
-                        found = m["web_name"].iloc[0]
-                        reason = f"token '{token}' in web_name"
-                        break
+    tgt = squad_df_normalized.copy()
+    tgt["player_full"] = (
+        tgt["first_name"].astype(str).str.strip()
+        + " "
+        + tgt["second_name"].astype(str).str.strip()
+    ).str.replace(r"\s+", " ", regex=True)
 
-        if found:
-            print(f"Found {row.get('last_name','')} -> {found} {team_note} ({reason})")
-            lst_taken.append(found)
+    linked = link_names(
+        source=src,
+        target=tgt,
+        source_name_col="full_name",
+        target_name_col="player_full",
+        source_team_col="team_abbr" if "team_abbr" in src.columns else None,
+        target_team_col="team_code" if "team_code" in tgt.columns else None,
+        cutoff=cutoff,
+    )
+    full_to_web = dict(zip(tgt["player_full"], tgt["web_name"]))
+    linked["matched_name"] = linked["matched_name"].map(full_to_web)
 
+    linked, _n_overrides = apply_curated_overrides(
+        linked, SLEEPER_NAME_CURATED_PATH, key_col="full_name", match_col="matched_name"
+    )
+
+    for _, row in linked.iterrows():
+        if pd.notna(row["matched_name"]):
+            print(
+                f"Found {row.get('last_name','')} -> {row['matched_name']} "
+                f"({row['match_method']})"
+            )
         else:
             print(
                 f"Did NOT find {row.get('last_name','')} (first='{row.get('first_name','')}')"
             )
-    return lst_taken
+
+    return linked.loc[linked["matched_name"].notna(), "matched_name"].tolist()
 
 
 def team_players_to_web_names(team_players, squad_df_normalized):
@@ -175,142 +283,8 @@ def team_players_to_web_names(team_players, squad_df_normalized):
     return lst_team_web_names
 
 
-# def sleeper_name_to_web_name(team_players, squad_df):
-#     """Create a mapping from Sleeper player IDs to web_name.
-#     ['last_name', 'first_name', 'search_last_name', 'full_name', 'search_full_name', 'team_abbr']
-#     """
-
-#     # ensure normalized columns on squad_df
-#     squad_df = normalize_squad_df(squad_df)
-
-#     lst_taken = []
-#     for owner_id, df_team_players in team_players.items():
-#         print("--" * 20)
-#         print(f"Owner {owner_id} has {len(df_team_players)} players")
-#         for _, row in df_team_players.iterrows():
-#             last_n = norm(row.get("last_name", ""))
-#             first_n = norm(row.get("first_name", ""))
-#             full_n = norm(row.get("full_name", ""))
-#             team_n = norm(row.get("team_abbr", ""))
-#             # restrict to same team if possible
-#             if team_n:
-#                 df_team = squad_df[squad_df["team_code_n"] == team_n]
-#                 if df_team.empty:
-#                     # fallback to whole dataset if team not found
-#                     df_team = squad_df
-#                     team_note = "(team not found, searching all teams)"
-#                 else:
-#                     team_note = f"(team match {team_n})"
-#             else:
-#                 df_team = squad_df
-#                 team_note = "(no team_abbr, searching all teams)"
-
-#             found = None
-#             reason = None
-
-#             # 1) exact web_name match (preferred)
-#             m = df_team[df_team["web_name_n"] == last_n]
-#             if not m.empty:
-#                 found = m["web_name"].iloc[0]
-#                 reason = "web_name exact match"
-#             else:
-#                 # 2) web_name contains last name
-#                 if last_n:
-#                     m = df_team[
-#                         df_team["web_name_n"].str.contains(re.escape(last_n), na=False)
-#                     ]
-#                     if not m.empty:
-#                         found = m["web_name"].iloc[0]
-#                         reason = "web_name contains last name"
-#                 # 3) first_name contains player's first name / nickname
-#                 if not found and first_n:
-#                     m = df_team[
-#                         df_team["first_name_n"].str.contains(
-#                             re.escape(first_n), na=False
-#                         )
-#                     ]
-#                     if not m.empty:
-#                         found = m["web_name"].iloc[0]
-#                         reason = "first_name contains first/nickname"
-#                 # 4) try tokens from full_name against web_name
-#                 if not found and full_n:
-#                     for token in full_n.split():
-#                         if not token:
-#                             continue
-#                         m = df_team[
-#                             df_team["web_name_n"].str.contains(
-#                                 re.escape(token), na=False
-#                             )
-#                         ]
-#                         if not m.empty:
-#                             found = m["web_name"].iloc[0]
-#                             reason = f"token '{token}' in web_name"
-#                             break
-
-#             if found:
-#                 print(
-#                     f"Found {row.get('last_name','')} -> {found} {team_note} ({reason})"
-#                 )
-#                 lst_taken.append(found)
-
-#             else:
-#                 print(
-#                     f"Did NOT find {row.get('last_name','')} (first='{row.get('first_name','')}')"
-#                 )
-#     return lst_taken
-
-
 def write_taken_to_csv(taken_list, filepath):
     """Write the list of taken players to a CSV file."""
     df_taken = pd.DataFrame(taken_list, columns=["web_name"])
     df_taken.to_csv(filepath, index=False)
     print(f"Wrote {len(taken_list)} taken players to {filepath}")
-
-
-# update sleeper_setup
-
-# league_id_info = requests.get(f"https://api.sleeper.app/v1/league/{league_id}").json()
-# print("League ID:", league_id)
-# print(league_id_info)
-
-# # get sleeper league users
-# league_users = requests.get(
-#     f"https://api.sleeper.app/v1/league/{league_id}/users"
-# ).json()
-# league_users_df = pd.DataFrame(league_users).T.reset_index()
-# print(league_users_df.head())
-
-# get league matchups
-# print(current_week)
-# league_matchups = requests.get(
-#     f"https://api.sleeper.app/v1/league/{league_id}/matchups/{current_week}"
-# ).json()
-# print(league_matchups)
-
-# get transactions
-# league_transactions = requests.get(
-#     f"https://api.sleeper.app/v1/league/{league_id}/transactions{current_week}"
-# ).json()
-# print("Transactions for week", current_week, ":", league_transactions)
-
-# get drafts
-# league_drafts = requests.get(
-#     f"https://api.sleeper.app/v1/league/{league_id}/drafts"
-# ).json()[0]
-# print("Drafts:")
-# print(league_drafts)
-# print("draft order:", league_drafts.get("draft_order", {}))
-
-# get draft picks
-# league_draft_picks = requests.get(
-#     f"https://api.sleeper.app/v1/draft/1259142777103470592/picks"
-# ).json()
-# print(league_draft_picks)
-
-# # get rosters from sleeper
-# print("Fetching Sleeper rosters...")
-# sleeper_rosters = requests.get(
-#     f"https://api.sleeper.app/v1/league/{league_id}/rosters"
-# ).json()
-# sleeper_rosters_df = pd.DataFrame(sleeper_rosters)  # .T.reset_index()
-# print(sleeper_rosters_df.head())
