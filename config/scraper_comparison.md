@@ -39,3 +39,36 @@ Sample (Arsenal, 2024/25):
 This is real, usable player-level xG/xA data - the block is a request-pacing
 problem, not a data-availability problem. **Decision stands: use Understat for
 xG/xA, with caching and tolerance for occasional retries.**
+
+## Addendum: Sleeper's own stats feed (found while working Plan B)
+
+Sleeper exposes an undocumented (docs.sleeper.com is NFL-only) but working
+stats feed, confirmed live against the completed 2024/25 season
+(league `1259142774104526848`, status `complete`):
+
+- `GET /v1/stats/clubsoccer:epl/regular/<season>/<week>` - per-player raw
+  stats + precomputed standard fantasy points (`pts_std`) for one gameweek.
+- `GET /stats/clubsoccer:epl/<season>?season_type=regular` (no `/v1/` prefix)
+  - same, at season-cumulative granularity, plus `rank_std` and embedded
+  player metadata. Data is sourced from **Opta** (`company: "opta"` field).
+
+Both are keyed by Sleeper's own `player_id` - **no name-matching needed at
+all**, unlike FBref/Understat. Verified real output for season 2025 (2024/25):
+top scorers were Bruno Fernandes (615.5 pts), Erling Haaland (509.0), Antoine
+Semenyo (432.0) - sane, plausible numbers. Implemented as
+`src/pdh/sleeper.py::get_player_week_stats()` / `get_player_season_stats()`.
+
+**Why this matters beyond "another source":** because it's pre-scored and
+keyed by Sleeper `player_id`, it's the only source that can directly validate
+the projection engine - compare `proj_points` (src/pdh/projections.py)
+against real `pts_std` for a past gameweek, with zero name-linking risk in
+the comparison itself. That backtest harness isn't built yet (would need the
+pipeline to reconstruct "what we'd have projected using only data available
+before week N," which the current single-snapshot `hist` load doesn't
+support) - noted as a natural follow-up, not done in this pass. The
+`/v1/league/<id>/matchups/<week>` endpoint, by contrast, returned 404 for
+every one of the 38 weeks of that same completed season - it does not appear
+to work for this sport/league at all, despite the league clearly having
+played a full head-to-head season (win/loss record on the roster object).
+Plan D's matchup-fetching should treat that endpoint as unreliable and lean on
+this stats feed instead where possible.
