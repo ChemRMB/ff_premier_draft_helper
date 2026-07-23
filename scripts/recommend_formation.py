@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 
 from pdh import fpl
+from pdh.seasons import current_season_tag
 from pdh.sleeper import (
     get_sleeper_rosters,
     get_sleeper_players,
@@ -25,7 +26,7 @@ args = ap.parse_args()
 
 project_root = Path(__file__).resolve().parents[1]
 path_data = project_root / "data"
-SEASON = 2526
+SEASON = current_season_tag()  # e.g. "2627" for 2026/27 (see config/seasons.yaml)
 GW = args.event if args.event is not None else fpl.current_gameweek()
 print(f"Using gameweek: {GW}")
 

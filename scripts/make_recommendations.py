@@ -29,6 +29,7 @@ from pdh.draft_board import (
     vor_from_ranks,
 )
 from pdh.sleeper import get_draft_picks, draft_picks_to_web_names, normalize_squad_df
+from pdh.seasons import current_season_dir
 
 
 # ---------------------------
@@ -73,7 +74,8 @@ args = ap.parse_args()
 # Paths & config
 # ---------------------------
 ROOT = Path(__file__).resolve().parents[1]
-OUTDIR = ROOT / "data" / "season_2526" / "game_weeks"
+SEASON_DIR = current_season_dir()
+OUTDIR = SEASON_DIR / "game_weeks"
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
 with open(ROOT / "config" / "seasons.yaml", "r") as fh:
@@ -103,10 +105,10 @@ team_season_stats = pd.read_csv(
 )  # from build_historical.py
 
 squads = pd.read_csv(
-    ROOT / "data" / "season_2526" / "current_squads.csv"
+    SEASON_DIR / "current_squads.csv"
 )  # from update_current.py
 fixtures = pd.read_csv(
-    ROOT / "data" / "season_2526" / "fixtures.csv"
+    SEASON_DIR / "fixtures.csv"
 )  # from update_current.py
 
 # ---------------------------

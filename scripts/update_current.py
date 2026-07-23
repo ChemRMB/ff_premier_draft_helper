@@ -6,6 +6,7 @@ import pandas as pd, yaml, json
 from pathlib import Path
 from pdh import fpl
 from pdh.fbref import schedule, flatten_cols
+from pdh.seasons import current_season_dir, load_seasons_config
 from pdh.sleeper import (
     get_sleeper_rosters,
     get_sleeper_players,
@@ -17,10 +18,10 @@ from pdh.sleeper import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
-outdir = ROOT / "data/season_2526"
+outdir = current_season_dir()
 outdir.mkdir(parents=True, exist_ok=True)
 
-cfg_seasons = yaml.safe_load(open(ROOT / "config/seasons.yaml", "r"))
+cfg_seasons = load_seasons_config()
 current_season_end_year = cfg_seasons["current_season_end_year"]
 
 print("Fetching current squads (FPL bootstrap)...")
@@ -32,22 +33,29 @@ print(df_squads_normalized.team_name.value_counts().sort_index())
 print("-" * 20)
 print(df_squads_normalized.team_name.nunique(), "teams in current squads")
 
-print("Fetching full fixtures...")
-fixtures_fbref = schedule(
-    seasons=[current_season_end_year],
-    leagues="ENG-Premier League",
-    use_safe=True,
-    cache_dir=ROOT / "data" / "cache" / "fbref",
-)
-if fixtures_fbref.index.names is not None:
-    fixtures_fbref = fixtures_fbref.reset_index()
-fixtures_fbref = flatten_cols(fixtures_fbref)
-fixtures_fpl = fpl.fixtures_df()
-fixtures = fixtures_fbref.join(fixtures_fpl)  # index based join
-
+print("Fetching full fixtures (FPL official API)...")
+# FPL's official fixtures endpoint is the primary source: reliable (official
+# API), already carries every column the projection pipeline needs (event =
+# gameweek, team_h/team_a, *_difficulty, finished, started, kickoff_time -
+# see fpl.fixtures_df / project_players), and is populated before the season
+# starts, so this works during pre-season / pre-draft. FBref's schedule
+# (slower, browser-scraped, and absent for a season that hasn't kicked off)
+# is only a fallback for the rare case FPL returns nothing.
+fixtures = fpl.fixtures_df()
+if fixtures.empty:
+    print("  [info] FPL fixtures empty; falling back to FBref schedule...")
+    fixtures_fbref = schedule(
+        seasons=[current_season_end_year],
+        leagues="ENG-Premier League",
+        use_safe=True,
+        cache_dir=ROOT / "data" / "cache" / "fbref",
+    )
+    if fixtures_fbref.index.names is not None:
+        fixtures_fbref = fixtures_fbref.reset_index()
+    fixtures = flatten_cols(fixtures_fbref)
 
 fixtures.to_csv(outdir / "fixtures.csv", index=False)
-print("Wrote:", outdir / "fixtures.csv")
+print("Wrote:", outdir / "fixtures.csv", f"({len(fixtures)} fixtures)")
 
 print("Fetching Sleeper stuff...")
 sleeper_roster_df = get_sleeper_rosters()

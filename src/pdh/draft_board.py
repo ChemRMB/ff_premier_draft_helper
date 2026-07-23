@@ -125,6 +125,114 @@ def vor_from_ranks(
     return pd.concat(rows, ignore_index=True).sort_values("VOR", ascending=False)
 
 
+def snake_pick_sequence(teams: int, rounds: int) -> List[int]:
+    """Full pick order for a snake draft, as team slot numbers (1..teams),
+    one entry per overall pick. Round 1 is 1..teams, round 2 reverses, etc."""
+    seq: List[int] = []
+    for r in range(1, rounds + 1):
+        order = list(range(1, teams + 1)) if r % 2 == 1 else list(range(teams, 0, -1))
+        seq.extend(order)
+    return seq
+
+
+def picks_until_next_turn(
+    slot_sequence: List[int], n_picks_made: int, my_slot: int
+) -> List[int]:
+    """
+    Team slots that will pick between now (`n_picks_made` picks already made)
+    and this team's (`my_slot`) next turn - i.e. every opponent pick you have
+    to sit through before you're on the clock again. Empty once the mock/live
+    draft is past `my_slot`'s last pick.
+    """
+    out: List[int] = []
+    for s in slot_sequence[n_picks_made:]:
+        if s == my_slot:
+            break
+        out.append(s)
+    return out
+
+
+def team_position_needs(
+    team_picks_pos: List[str], roster_positions: List[str]
+) -> Dict[str, bool]:
+    """
+    Which of F/M/D/GK a team still has an unfilled *required* (non-flex,
+    non-bench) slot for, given the positions they've drafted so far
+    (`team_picks_pos`, e.g. picks_df[picks_df.roster_id==X]["pos"].tolist()).
+    Conservative like replacement_ranks/compute_vor: flex slots are ignored,
+    so a team is only "still needing" a position while it hasn't filled that
+    position's pure starting slots yet - once it has, this stops counting
+    them as in the market for it (they might still take one for a flex/bench
+    spot, but that's much less predictable, so it's excluded from the
+    heuristic rather than guessed at).
+    """
+    req = roster_requirements(roster_positions)
+    base_need = {pos: req.get(pos, 0) for pos in ("F", "M", "D", "GK")}
+    have: Dict[str, int] = {}
+    for p in team_picks_pos:
+        have[p] = have.get(p, 0) + 1
+    return {pos: have.get(pos, 0) < n for pos, n in base_need.items()}
+
+
+def positional_scarcity(
+    board: pd.DataFrame,
+    picks_df: pd.DataFrame,
+    roster_positions: List[str],
+    teams: int,
+    rounds: int,
+    my_slot: int,
+    n_picks_made: int,
+    slot_to_roster_id: Dict[int, int],
+    pos_col: str = "pos",
+    vor_col: str = "VOR",
+) -> pd.DataFrame:
+    """
+    Per-position "run risk" heuristic for a live snake draft: given the exact
+    picks that will happen before your next turn (from the snake order), how
+    many of those picking teams still need that position (see
+    team_position_needs) versus how many "quality" (VOR > 0, i.e. still
+    above replacement) players are left at it on `board`. A `scarcity_ratio`
+    > 1 means more hungry teams than quality players remain at that position
+    before you pick again - i.e. a real risk the position "runs out" on you,
+    worth weighing against pure VOR when deciding what to take right now.
+
+    This is a heuristic, not a prediction: it assumes a team "in need" of a
+    position might take one, not that it definitely will. `picks_df` needs
+    `roster_id` and `pos` columns (see pdh.webapp.data.load_live_draft_picks).
+    """
+    seq = snake_pick_sequence(teams, rounds)
+    upcoming_slots = picks_until_next_turn(seq, n_picks_made, my_slot)
+    upcoming_roster_ids = [slot_to_roster_id[s] for s in upcoming_slots if s in slot_to_roster_id]
+
+    rows = []
+    for pos in ("F", "M", "D", "GK"):
+        remaining_quality = int(
+            ((board[pos_col] == pos) & (board[vor_col] > 0)).sum()
+        )
+        demand = 0
+        for rid in upcoming_roster_ids:
+            team_pos = (
+                picks_df.loc[picks_df["roster_id"] == rid, "pos"].tolist()
+                if not picks_df.empty
+                else []
+            )
+            if team_position_needs(team_pos, roster_positions).get(pos, False):
+                demand += 1
+        ratio = demand / max(1, remaining_quality)
+        rows.append(
+            {
+                "pos": pos,
+                "remaining_quality": remaining_quality,
+                "picks_before_your_turn": len(upcoming_roster_ids),
+                "teams_needing": demand,
+                "scarcity_ratio": ratio,
+            }
+        )
+    return pd.DataFrame(rows).sort_values("scarcity_ratio", ascending=False).reset_index(
+        drop=True
+    )
+
+
 def compute_vor(
     df: pd.DataFrame,
     pos_col="pos",

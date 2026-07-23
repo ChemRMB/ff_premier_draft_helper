@@ -83,39 +83,93 @@ def get_draft_picks(draft_id: str) -> list[dict]:
     return response.json()
 
 
-def draft_picks_to_web_names(
+def draft_picks_df(
     picks: list[dict], squad_df_normalized: pd.DataFrame, cutoff: float = 0.90
-) -> list[str]:
+) -> pd.DataFrame:
     """
-    Convert live Sleeper draft picks (see get_draft_picks) to FPL `web_name`
-    values - lets taken.csv auto-populate from the real live draft instead of
-    hand-typing every opponent's pick during a live snake draft. Reuses
-    get_sleeper_name_to_web_name's matching (full name -> web_name, since
-    FPL's web_name is often abbreviated) by shaping picks into the same
-    full_name/team_abbr/first_name/last_name columns it expects.
+    Convert live Sleeper draft picks (see get_draft_picks) into a DataFrame -
+    one row per pick, preserving `picked_by`/`roster_id`/`round`/`pick_no` -
+    with a matched FPL `web_name` column (NaN if unmatched). Used by the
+    Streamlit "live draft" view to show who each team has picked so far, and
+    by `draft_picks_to_web_names` for the flat taken-player list.
+
+    Matches the same way as get_sleeper_name_to_web_name (full name -> FPL's
+    often-abbreviated web_name), with the same curated-override file
+    (config/name_link_sleeper_curated.csv), but keeps every pick row instead
+    of dropping unmatched ones - unmatched rows still carry real
+    picked_by/round info the caller may want to show (e.g. "opponent picked
+    someone we couldn't identify").
     """
     if not picks:
-        return []
+        return pd.DataFrame(
+            columns=[
+                "player_id",
+                "picked_by",
+                "roster_id",
+                "round",
+                "pick_no",
+                "full_name",
+                "team_abbr",
+                "web_name",
+                "match_method",
+            ]
+        )
+
     rows = []
     for p in picks:
         meta = p.get("metadata") or {}
         first = meta.get("first_name", "")
         last = meta.get("last_name", "")
-        full_name = f"{first} {last}".strip()
-        if not full_name:
-            continue
         rows.append(
             {
-                "full_name": full_name,
+                "player_id": p.get("player_id"),
+                "picked_by": p.get("picked_by"),
+                "roster_id": p.get("roster_id"),
+                "round": p.get("round"),
+                "pick_no": p.get("pick_no"),
+                "full_name": f"{first} {last}".strip(),
                 "team_abbr": meta.get("team", ""),
-                "last_name": last,
                 "first_name": first,
+                "last_name": last,
             }
         )
-    if not rows:
-        return []
     picks_df = pd.DataFrame(rows)
-    return get_sleeper_name_to_web_name(picks_df, squad_df_normalized, cutoff=cutoff)
+
+    tgt = squad_df_normalized.copy()
+    tgt["player_full"] = (
+        tgt["first_name"].astype(str).str.strip()
+        + " "
+        + tgt["second_name"].astype(str).str.strip()
+    ).str.replace(r"\s+", " ", regex=True)
+
+    linked = link_names(
+        source=picks_df,
+        target=tgt,
+        source_name_col="full_name",
+        target_name_col="player_full",
+        source_team_col="team_abbr" if "team_abbr" in picks_df.columns else None,
+        target_team_col="team_code" if "team_code" in tgt.columns else None,
+        cutoff=cutoff,
+    )
+    full_to_web = dict(zip(tgt["player_full"], tgt["web_name"]))
+    linked["web_name"] = linked["matched_name"].map(full_to_web)
+
+    linked, _n_overrides = apply_curated_overrides(
+        linked, SLEEPER_NAME_CURATED_PATH, key_col="full_name", match_col="web_name"
+    )
+    return linked.drop(columns=["matched_name"], errors="ignore")
+
+
+def draft_picks_to_web_names(
+    picks: list[dict], squad_df_normalized: pd.DataFrame, cutoff: float = 0.90
+) -> list[str]:
+    """
+    Flat list of FPL `web_name` values already drafted (unmatched picks
+    dropped) - see draft_picks_df for the full per-pick DataFrame. Used to
+    auto-populate taken.csv during a live draft.
+    """
+    df = draft_picks_df(picks, squad_df_normalized, cutoff=cutoff)
+    return df.loc[df["web_name"].notna(), "web_name"].tolist()
 
 
 def get_player_week_stats(season: int, week: int, sport: str = "clubsoccer:epl") -> pd.DataFrame:

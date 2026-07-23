@@ -113,6 +113,11 @@ def current_squads_df() -> pd.DataFrame:
         "chance_of_playing_next_round",
         "chance_of_playing_this_round",
         "pos",
+        "team",  # numeric FPL team id, straight from bootstrap (same fetch as
+        # team_name below) - carrying it here keeps team id and team_name
+        # consistent and avoids a fragile re-merge-by-name downstream, which
+        # breaks when the pre-season FPL API briefly serves a different team
+        # set than current_squads.csv was built from.
         "name",
         "short_name",
         "minutes",

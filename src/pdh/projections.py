@@ -306,6 +306,7 @@ def build_weighted_points90(
     understat_df: pd.DataFrame | None = None,
     xg_shrink_k: float = 900.0,
     fpl_xg_df: pd.DataFrame | None = None,
+    points90_shrink_k: float = 900.0,
 ) -> pd.DataFrame:
     """
     One row per player: season-weighted per-90 Sleeper fantasy points at each
@@ -322,6 +323,17 @@ def build_weighted_points90(
     useful since Understat can soft-block after repeated automated requests.
     Omitting both (the default) reproduces the original, actuals-only
     behavior exactly.
+
+    Separately (and always applied, not optional): each player-season's raw
+    points90_{pos} is itself shrunk toward that season's across-league mean
+    at that position, weighted by the player's total minutes that season
+    (`normalize.blend_with_shrinkage`, `k=points90_shrink_k`). Without this,
+    a handful of low-minute cameo appearances (e.g. 4 minutes with a goal)
+    can produce a nonsensical 100+ points-per-90 rate that then dominates
+    team-power aggregates (build_team_power's roster_att/roster_def, which
+    sum the top-N players by this rate) and that player's own projection
+    alike - the rate itself carries no signal about reliability at tiny
+    sample sizes, only the shrinkage toward a sane prior does.
     """
     hist = hist.copy()
     if "minutes" not in hist.columns:
@@ -349,6 +361,23 @@ def build_weighted_points90(
     for pos in ["F", "M", "D", "GK"]:
         per_season[f"points90_{pos}"] = per_season.apply(
             lambda r: score_row_per90(r, pos), axis=1
+        )
+
+    season_minutes_sum = (
+        hist.groupby(["player", "season"])["minutes"]
+        .sum()
+        .reset_index()
+        .rename(columns={"minutes": "season_minutes_sum"})
+    )
+    per_season = per_season.merge(season_minutes_sum, on=["player", "season"], how="left")
+    for pos in ["F", "M", "D", "GK"]:
+        col = f"points90_{pos}"
+        season_prior = per_season.groupby("season")[col].transform("mean")
+        per_season[col] = blend_with_shrinkage(
+            per_season[col],
+            season_prior,
+            per_season["season_minutes_sum"],
+            k=points90_shrink_k,
         )
 
     agg = per_season.copy()
@@ -426,11 +455,35 @@ def _agg_team_season_def(grp: pd.DataFrame) -> pd.Series:
 
 
 def _norm_mean1(s: pd.Series) -> pd.Series:
+    """
+    For strictly-positive metrics (e.g. roster_att/roster_def - sums of
+    points90 rates, always >= 0): normalize to mean=1.0 by dividing by the
+    mean. NOT valid for signed, ~zero-mean inputs like z-scores - see
+    _zscore_to_mult for those (dividing a value near 0 by a mean near 0
+    explodes the scale and can flip sign, producing a nonsensical negative
+    "power" multiplier).
+    """
     s = pd.to_numeric(s, errors="coerce")
     mu = s.mean()
     if mu == 0 or np.isnan(mu):
         return s.fillna(0.0).apply(lambda x: 1.0)
     return (s / mu).replace([np.inf, -np.inf], 1.0).fillna(1.0)
+
+
+def _zscore_to_mult(
+    s: pd.Series, scale: float = 0.15, clip: tuple[float, float] = (0.7, 1.4)
+) -> pd.Series:
+    """
+    Convert a z-score-like index (e.g. attack_idx_hist/defense_idx_hist from
+    _zscore_per_season - mean ~0, can be negative) into a multiplicative
+    index centered at 1.0: `1.0 + scale * z`, clipped to a modest range so
+    one team's history can't dominate a blend or send projected points
+    negative. `scale=0.15` means a team 1 std-dev above average gets a 15%
+    boost; `clip` bounds the most extreme teams (e.g. the current-season-only
+    Sunderland with no real multi-season history, z=0) to a sane range.
+    """
+    s = pd.to_numeric(s, errors="coerce")
+    return (1.0 + scale * s).clip(*clip).fillna(1.0)
 
 
 def _winsor_mean1_shrink(
@@ -651,15 +704,19 @@ def build_team_power(
     for c in ["attack_idx_hist", "defense_idx_hist", "roster_att", "roster_def"]:
         team_power[c] = pd.to_numeric(team_power[c], errors="coerce")
 
-    team_power["attack_hist_n"] = _norm_mean1(team_power["attack_idx_hist"])
+    # attack_idx_hist/defense_idx_hist are z-scores (mean ~0, can be
+    # negative) - _zscore_to_mult, not _norm_mean1, is the correct transform
+    # (see both docstrings). roster_att/roster_def are positive sums of
+    # points90 rates, where _norm_mean1 is valid.
+    team_power["attack_hist_n"] = _zscore_to_mult(team_power["attack_idx_hist"])
     team_power["roster_att_n"] = _norm_mean1(team_power["roster_att"])
-    team_power["defense_hist_n"] = _norm_mean1(team_power["defense_idx_hist"])
+    team_power["defense_hist_n"] = _zscore_to_mult(team_power["defense_idx_hist"])
     team_power["roster_def_n"] = _norm_mean1(team_power["roster_def"])
 
-    att_hist_n = _norm_mean1(team_power["attack_idx_hist"]).fillna(1.0)
-    ros_att_n = _norm_mean1(team_power["roster_att"]).fillna(1.0)
-    def_hist_n = _norm_mean1(team_power["defense_idx_hist"]).fillna(1.0)
-    ros_def_n = _norm_mean1(team_power["roster_def"]).fillna(1.0)
+    att_hist_n = team_power["attack_hist_n"].fillna(1.0)
+    ros_att_n = team_power["roster_att_n"].fillna(1.0)
+    def_hist_n = team_power["defense_hist_n"].fillna(1.0)
+    ros_def_n = team_power["roster_def_n"].fillna(1.0)
 
     att_blend = alpha_hist * att_hist_n + alpha_ros * ros_att_n
     def_blend = alpha_hist * def_hist_n + alpha_ros * ros_def_n
@@ -806,8 +863,17 @@ def project_players(
         team_diff[int(r["team_a"])] = int(r["team_a_difficulty"])
     players["gw_difficulty"] = players["team"].map(team_diff)
 
+    # Guard against NaN team ids: pandas merges NaN==NaN, so if several teams
+    # failed id resolution (e.g. pre-season FPL API drift), every player on
+    # any such team would cartesian-join every NaN-team row in team_power -
+    # duplicating players and cross-contaminating their team power. Only
+    # merge rows with a real team id; NaN-team players keep neutral (1.0)
+    # power via the fillna below.
+    tp_keyed = team_power[["team", "team_name", "attack_power", "defense_power"]].dropna(
+        subset=["team"]
+    )
     players = players.merge(
-        team_power[["team", "team_name", "attack_power", "defense_power"]],
+        tp_keyed,
         on="team",
         how="left",
         suffixes=("", "_tp"),
