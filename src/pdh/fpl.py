@@ -73,9 +73,17 @@ def current_squads_df() -> pd.DataFrame:
         "pos",
         "name",
         "short_name",
+        "minutes",
+        "expected_goals_per_90",
+        "expected_assists_per_90",
     ]
     return df[keep].rename(
-        columns={"id": "element_id", "name": "team_name", "short_name": "team_code"}
+        columns={
+            "id": "element_id",
+            "name": "team_name",
+            "short_name": "team_code",
+            "minutes": "fpl_minutes",
+        }
     )
 
 

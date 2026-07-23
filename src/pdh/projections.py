@@ -153,52 +153,122 @@ def link_understat_to_fbref_names(
     return linked.rename(columns={"matched_name": "player_fbref"})
 
 
+def fpl_xg_table(
+    squads_df: pd.DataFrame,
+    season_end_year: int,
+    min_minutes: float = 90.0,
+) -> pd.DataFrame:
+    """
+    FPL's own current-season expected_goals_per_90/expected_assists_per_90
+    (bootstrap-static `elements`, see pdh.fpl.current_squads_df), already
+    keyed to FBref names via the `player_fbref` column added to `squads_df`
+    by the FPL<->FBref name link in make_recommendations.py. Meant to
+    supplement Understat in blend_expected_goals: FPL's public API doesn't
+    soft-block the way Understat can, so it fills gaps where Understat has no
+    row for a player (blocked fetch, or a name-link miss) rather than
+    replacing Understat where it *does* have data.
+
+    Only covers `season_end_year` (the current season) - bootstrap-static
+    only exposes cumulative current-season totals, not a season-by-season
+    history like Understat's player_season_stats. Rows with fewer than
+    `min_minutes` played are dropped: FPL reports exactly 0.00 (not NaN) for
+    a per-90 rate with ~no minutes played, which would otherwise look like a
+    real (and misleadingly confident) zero-xG signal.
+    """
+    needed = {
+        "player_fbref",
+        "expected_goals_per_90",
+        "expected_assists_per_90",
+        "fpl_minutes",
+    }
+    if squads_df is None or squads_df.empty or not needed.issubset(squads_df.columns):
+        return pd.DataFrame(columns=["player", "season", "xg_p90", "xa_p90"])
+
+    out = squads_df[list(needed)].dropna(subset=["player_fbref"]).copy()
+    out["fpl_minutes"] = pd.to_numeric(out["fpl_minutes"], errors="coerce")
+    out = out[out["fpl_minutes"] >= min_minutes]
+    out["xg_p90"] = pd.to_numeric(out["expected_goals_per_90"], errors="coerce")
+    out["xa_p90"] = pd.to_numeric(out["expected_assists_per_90"], errors="coerce")
+    out["season"] = season_end_year
+    out = out.rename(columns={"player_fbref": "player"})[
+        ["player", "season", "xg_p90", "xa_p90"]
+    ]
+    return out.groupby(["player", "season"], as_index=False).mean(numeric_only=True)
+
+
 def blend_expected_goals(
     per_season: pd.DataFrame,
     hist: pd.DataFrame,
-    understat_df: pd.DataFrame,
+    understat_df: pd.DataFrame | None,
     k: float = 900.0,
+    fpl_xg_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
-    Blend FBref actual goals_p90/assists_p90 in `per_season` toward Understat's
-    xG_p90/xA_p90 using shrinkage (normalize.blend_with_shrinkage), trusting
-    actuals more as a player accumulates minutes that season. Rows with no
-    Understat match, or missing goals_p90/assists_p90 to begin with, are left
-    untouched. `understat_df` is the raw output of
-    `pdh.understat.player_season_stats()` (columns include player, team,
-    season_id, minutes, goals, xg, assists, xa).
+    Blend FBref actual goals_p90/assists_p90 in `per_season` toward an
+    expected-goals/assists rate using shrinkage (normalize.blend_with_shrinkage),
+    trusting actuals more as a player accumulates minutes that season. Rows
+    with no expected-rate match, or missing goals_p90/assists_p90 to begin
+    with, are left untouched.
+
+    `understat_df` is the raw output of `pdh.understat.player_season_stats()`
+    (columns include player, team, season_id, minutes, goals, xg, assists,
+    xa) and is the primary xG/xA source, covering all historical seasons.
+    `fpl_xg_df` (see fpl_xg_table) supplements it for the current season with
+    FPL's own expected_goals_per_90/expected_assists_per_90, filling rows
+    Understat is missing (soft-blocked fetch, or a name-link miss) rather
+    than overriding rows it already has.
     """
     if "goals_p90" not in per_season.columns and "assists_p90" not in per_season.columns:
         return per_season
 
-    if understat_df.empty:
+    have_understat = understat_df is not None and not understat_df.empty
+    have_fpl = fpl_xg_df is not None and not fpl_xg_df.empty
+    if not have_understat and not have_fpl:
         return per_season
 
-    fbref_names = (
-        hist[["player", "team"]].drop_duplicates()
-        if "team" in hist.columns
-        else hist[["player"]].drop_duplicates()
-    )
-    linked = link_understat_to_fbref_names(understat_df, fbref_names).dropna(
-        subset=["player_fbref"]
-    )
-    if linked.empty:
-        return per_season
+    if have_understat:
+        fbref_names = (
+            hist[["player", "team"]].drop_duplicates()
+            if "team" in hist.columns
+            else hist[["player"]].drop_duplicates()
+        )
+        linked = link_understat_to_fbref_names(understat_df, fbref_names).dropna(
+            subset=["player_fbref"]
+        )
+    else:
+        linked = pd.DataFrame()
 
-    u = linked.copy()
-    # Understat's season_id is the start year (e.g. 2024 for 2024/25); hist/FBref
-    # use the end year (2025) - see src/pdh/understat.py::season_to_understat_str.
-    u["season"] = pd.to_numeric(u["season_id"], errors="coerce") + 1
-    minutes = pd.to_numeric(u["minutes"], errors="coerce")
-    m90 = (minutes / 90.0).replace(0, np.nan)
-    u["xg_p90"] = pd.to_numeric(u["xg"], errors="coerce") / m90
-    u["xa_p90"] = pd.to_numeric(u["xa"], errors="coerce") / m90
-    u = (
-        u[["player_fbref", "season", "xg_p90", "xa_p90"]]
-        .rename(columns={"player_fbref": "player"})
-        .groupby(["player", "season"], as_index=False)
-        .mean(numeric_only=True)
-    )
+    if not linked.empty:
+        u = linked.copy()
+        # Understat's season_id is the start year (e.g. 2024 for 2024/25); hist/FBref
+        # use the end year (2025) - see src/pdh/understat.py::season_to_understat_str.
+        u["season"] = pd.to_numeric(u["season_id"], errors="coerce") + 1
+        minutes = pd.to_numeric(u["minutes"], errors="coerce")
+        m90 = (minutes / 90.0).replace(0, np.nan)
+        u["xg_p90"] = pd.to_numeric(u["xg"], errors="coerce") / m90
+        u["xa_p90"] = pd.to_numeric(u["xa"], errors="coerce") / m90
+        u = (
+            u[["player_fbref", "season", "xg_p90", "xa_p90"]]
+            .rename(columns={"player_fbref": "player"})
+            .groupby(["player", "season"], as_index=False)
+            .mean(numeric_only=True)
+        )
+    else:
+        u = pd.DataFrame(columns=["player", "season", "xg_p90", "xa_p90"])
+
+    if have_fpl:
+        u = u.merge(fpl_xg_df, on=["player", "season"], how="outer", suffixes=("", "_fpl"))
+        if "xg_p90_fpl" in u.columns:
+            u["xg_p90"] = pd.to_numeric(u["xg_p90"], errors="coerce").fillna(
+                pd.to_numeric(u.pop("xg_p90_fpl"), errors="coerce")
+            )
+        if "xa_p90_fpl" in u.columns:
+            u["xa_p90"] = pd.to_numeric(u["xa_p90"], errors="coerce").fillna(
+                pd.to_numeric(u.pop("xa_p90_fpl"), errors="coerce")
+            )
+
+    if u.empty:
+        return per_season
 
     season_minutes = (
         hist.groupby(["player", "season"])["minutes"]
@@ -235,6 +305,7 @@ def build_weighted_points90(
     stat_map: dict,
     understat_df: pd.DataFrame | None = None,
     xg_shrink_k: float = 900.0,
+    fpl_xg_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     One row per player: season-weighted per-90 Sleeper fantasy points at each
@@ -245,8 +316,12 @@ def build_weighted_points90(
     goals_p90/assists_p90 are first shrunk toward Understat's xG_p90/xA_p90
     (see blend_expected_goals) before being scored - more stable projections,
     especially for low-minute samples where finishing variance dominates raw
-    actuals. Omitting `understat_df` (the default) reproduces the original,
-    actuals-only behavior exactly.
+    actuals. `fpl_xg_df` (see fpl_xg_table) supplements Understat for the
+    current season using FPL's own expected_goals_per_90/expected_assists_per_90,
+    filling gaps rather than overriding Understat where it already has data -
+    useful since Understat can soft-block after repeated automated requests.
+    Omitting both (the default) reproduces the original, actuals-only
+    behavior exactly.
     """
     hist = hist.copy()
     if "minutes" not in hist.columns:
@@ -255,8 +330,10 @@ def build_weighted_points90(
 
     per_season = hist.groupby(["player", "season"])[per90_cols].mean().reset_index()
 
-    if understat_df is not None:
-        per_season = blend_expected_goals(per_season, hist, understat_df, k=xg_shrink_k)
+    if understat_df is not None or fpl_xg_df is not None:
+        per_season = blend_expected_goals(
+            per_season, hist, understat_df, k=xg_shrink_k, fpl_xg_df=fpl_xg_df
+        )
 
     mins_per_season = hist.groupby(["player", "season"])["minutes"].mean().reset_index()
     mins_tmp = mins_per_season.copy()

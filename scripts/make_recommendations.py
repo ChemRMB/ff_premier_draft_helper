@@ -15,7 +15,12 @@ import yaml
 
 from pdh.scoring import load_sleeper_scoring, load_stat_map
 from pdh import fpl  # used to fetch FPL team ids if missing
-from pdh.projections import build_weighted_points90, build_team_power, project_players
+from pdh.projections import (
+    build_weighted_points90,
+    build_team_power,
+    project_players,
+    fpl_xg_table,
+)
 from pdh import understat as pdh_understat
 
 
@@ -453,26 +458,11 @@ def subtract_used_slots(req: dict[str, int], used_slots: pd.Series) -> dict[str,
 
 
 # ---------------------------
-# 1) Build season-weighted per90 points per player, per position
+# 1) Name mapping + team ids
 # ---------------------------
-# See src/pdh/projections.py for the actual per-90 scoring / team-power /
-# gameweek-projection engine (Plan B extraction from this script).
-try:
-    understat_df = pdh_understat.player_season_stats(cfg_seasons["historical_seasons"])
-    if understat_df.empty:
-        print("[warn] Understat returned no rows (season not started, or soft-blocked); proceeding without xG/xA blending.")
-        understat_df = None
-except Exception as e:
-    print(f"[warn] Understat fetch failed ({e}); proceeding without xG/xA blending.")
-    understat_df = None
-
-weighted = build_weighted_points90(hist, weights, scoring, stat_map, understat_df=understat_df)
-
-
-# ---------------------------
-# 2) Name mapping + team ids
-# ---------------------------
-# Build player_full in squads and name link to FBref
+# Build player_full in squads and name link to FBref. Done before the
+# weighted-points build below, since the FPL xG/xA supplement needs
+# squads' player_fbref column already attached.
 squads["player_full"] = (
     squads["first_name"].astype(str).str.strip()
     + " "
@@ -493,6 +483,31 @@ if missing_team:
     print(
         f"[warn] {missing_team} squad rows have no numeric team id; applying neutral team multipliers for those."
     )
+
+# ---------------------------
+# 2) Build season-weighted per90 points per player, per position
+# ---------------------------
+# See src/pdh/projections.py for the actual per-90 scoring / team-power /
+# gameweek-projection engine (Plan B extraction from this script).
+try:
+    understat_df = pdh_understat.player_season_stats(cfg_seasons["historical_seasons"])
+    if understat_df.empty:
+        print("[warn] Understat returned no rows (season not started, or soft-blocked); proceeding without xG/xA blending.")
+        understat_df = None
+except Exception as e:
+    print(f"[warn] Understat fetch failed ({e}); proceeding without xG/xA blending.")
+    understat_df = None
+
+# FPL's own expected_goals_per_90/expected_assists_per_90 (bootstrap-static)
+# supplements Understat for the current season - fills gaps where Understat
+# is blocked or a name doesn't link, without needing its own scraper.
+fpl_xg_df = fpl_xg_table(squads, season_end_year=cfg_seasons["current_season_end_year"])
+if fpl_xg_df.empty:
+    fpl_xg_df = None
+
+weighted = build_weighted_points90(
+    hist, weights, scoring, stat_map, understat_df=understat_df, fpl_xg_df=fpl_xg_df
+)
 
 
 # ---------------------------
