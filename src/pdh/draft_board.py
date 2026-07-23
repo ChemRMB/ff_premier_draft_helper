@@ -82,6 +82,49 @@ def effective_replacement_ranks_with_flex(
     return counts  # replacement ranks including flex
 
 
+def vor_from_ranks(
+    df: pd.DataFrame,
+    repl_ranks: Dict[str, int],
+    pos_col: str = "pos",
+    proj_col: str = "proj_points",
+) -> pd.DataFrame:
+    """
+    VOR = player's projected points minus the projected points of the
+    replacement-level player at that position, given pre-computed
+    replacement ranks per position (see replacement_ranks for the pure-
+    position case, effective_replacement_ranks_with_flex for the flex-aware
+    case - both a rank K means "the Kth-best player at that position is
+    replacement level").
+    """
+    rows = []
+    for pos, k in repl_ranks.items():
+        sub = (
+            df[df[pos_col] == pos]
+            .sort_values(proj_col, ascending=False)
+            .reset_index(drop=True)
+        )
+        if len(sub) == 0:
+            continue
+        k = max(1, int(k))
+        repl_points = sub.iloc[min(len(sub) - 1, k - 1)][proj_col]
+        sub = sub.copy()
+        sub["replacement_at_rank"] = k
+        sub["replacement_points"] = repl_points
+        sub["VOR"] = sub[proj_col] - repl_points
+        rows.append(sub)
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                pos_col,
+                proj_col,
+                "replacement_at_rank",
+                "replacement_points",
+                "VOR",
+            ]
+        )
+    return pd.concat(rows, ignore_index=True).sort_values("VOR", ascending=False)
+
+
 def compute_vor(
     df: pd.DataFrame,
     pos_col="pos",
@@ -90,30 +133,10 @@ def compute_vor(
     teams=8,
 ) -> pd.DataFrame:
     """
-    VOR = player's projected points minus the projected points of the replacement-level player at that position.
-    Replacement is defined at rank K where K = total starting slots at that position (pure positions only).
-    Flex is ignored in replacement definition to keep it conservative.
+    VOR for the pure-position case (flex slots ignored, to keep replacement
+    ranks conservative) - see vor_from_ranks for the underlying computation.
     """
     if req is None:
         raise ValueError("Provide roster requirements dict")
     repl = replacement_ranks(req, teams=teams)
-    out = []
-    for pos, k in repl.items():
-        sub = (
-            df[df[pos_col] == pos]
-            .sort_values(proj_col, ascending=False)
-            .reset_index(drop=True)
-        )
-        if len(sub) == 0:
-            continue
-        repl_points = (
-            sub.iloc[min(len(sub) - 1, max(k - 1, 0))][proj_col]
-            if k > 0
-            else sub.iloc[-1][proj_col]
-        )
-        sub = sub.copy()
-        sub["replacement_at_rank"] = k
-        sub["replacement_points"] = repl_points
-        sub["VOR"] = sub[proj_col] - repl_points
-        out.append(sub)
-    return pd.concat(out, ignore_index=True).sort_values("VOR", ascending=False)
+    return vor_from_ranks(df, repl, pos_col=pos_col, proj_col=proj_col)

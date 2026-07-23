@@ -68,6 +68,56 @@ def get_league_drafts(league_id: str = LEAGUE_ID) -> list[dict]:
     return response.json()
 
 
+def get_draft_picks(draft_id: str) -> list[dict]:
+    """
+    Fetch all picks made so far in a draft from the Sleeper API. Empty list
+    before the draft starts. Each pick has `player_id`/`picked_by`/`round`/
+    `pick_no` and a `metadata` dict which - per the NFL-documented shape,
+    unverified but observed consistent for club soccer - includes that
+    pick's `first_name`/`last_name`/`team` directly, so no separate
+    get_sleeper_players() lookup is needed to identify who was picked.
+    """
+    url = f"https://api.sleeper.app/v1/draft/{draft_id}/picks"
+    response = requests.get(url)
+    response.raise_for_status()
+    return response.json()
+
+
+def draft_picks_to_web_names(
+    picks: list[dict], squad_df_normalized: pd.DataFrame, cutoff: float = 0.90
+) -> list[str]:
+    """
+    Convert live Sleeper draft picks (see get_draft_picks) to FPL `web_name`
+    values - lets taken.csv auto-populate from the real live draft instead of
+    hand-typing every opponent's pick during a live snake draft. Reuses
+    get_sleeper_name_to_web_name's matching (full name -> web_name, since
+    FPL's web_name is often abbreviated) by shaping picks into the same
+    full_name/team_abbr/first_name/last_name columns it expects.
+    """
+    if not picks:
+        return []
+    rows = []
+    for p in picks:
+        meta = p.get("metadata") or {}
+        first = meta.get("first_name", "")
+        last = meta.get("last_name", "")
+        full_name = f"{first} {last}".strip()
+        if not full_name:
+            continue
+        rows.append(
+            {
+                "full_name": full_name,
+                "team_abbr": meta.get("team", ""),
+                "last_name": last,
+                "first_name": first,
+            }
+        )
+    if not rows:
+        return []
+    picks_df = pd.DataFrame(rows)
+    return get_sleeper_name_to_web_name(picks_df, squad_df_normalized, cutoff=cutoff)
+
+
 def get_player_week_stats(season: int, week: int, sport: str = "clubsoccer:epl") -> pd.DataFrame:
     """
     Fetch Sleeper's own raw per-player stats and precomputed standard fantasy

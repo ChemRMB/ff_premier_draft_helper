@@ -22,6 +22,13 @@ from pdh.projections import (
     fpl_xg_table,
 )
 from pdh import understat as pdh_understat
+from pdh.draft_board import (
+    roster_requirements,
+    replacement_ranks,
+    effective_replacement_ranks_with_flex,
+    vor_from_ranks,
+)
+from pdh.sleeper import get_draft_picks, draft_picks_to_web_names, normalize_squad_df
 
 
 # ---------------------------
@@ -46,6 +53,18 @@ ap.add_argument(
     type=int,
     default=4,
     help="Lookahead weeks to rate bench picks.",
+)
+ap.add_argument(
+    "--refresh",
+    action="store_true",
+    help=(
+        "Recompute projections from scratch (name-linking, Understat, team power) "
+        "instead of using the cached per-GW players_projected.csv. Only the taken-"
+        "player filter and downstream draft board/planner depend on taken.csv, so "
+        "during a live draft you normally only need --refresh on the first run for "
+        "a gameweek - each subsequent run (after an opponent picks) can reuse the "
+        "cache and just re-filter, which is much faster."
+    ),
 )
 args = ap.parse_args()
 
@@ -90,6 +109,24 @@ fixtures = pd.read_csv(
     ROOT / "data" / "season_2526" / "fixtures.csv"
 )  # from update_current.py
 
+# ---------------------------
+# Gameweek + projections cache (Plan C: precompute ahead of draft day so the
+# live in-draft loop - rerun after every opponent pick - only redoes the
+# cheap taken-filter/ranking step, not name-linking/Understat/team power)
+# ---------------------------
+upcoming = fixtures[~fixtures["finished"]].sort_values(["event", "kickoff_time"])
+if args.event is not None:
+    gw = int(args.event)
+else:
+    gw = int(upcoming["event"].min()) if len(upcoming) else int(fixtures["event"].max())
+
+gw_tag = f"gw{gw}"
+OUTDIR_GW = OUTDIR / gw_tag
+OUTDIR_GW.mkdir(parents=True, exist_ok=True)
+
+PLAYERS_CACHE_PATH = OUTDIR_GW / "players_projected_cache.csv"
+use_cached_projections = not args.refresh and PLAYERS_CACHE_PATH.exists()
+
 
 # ---------------------------
 # Helpers
@@ -97,87 +134,9 @@ fixtures = pd.read_csv(
 # Position/team constants, per-90 scoring, team power model, and gameweek
 # projection logic now live in src/pdh/projections.py (Plan B extraction).
 FLEX_MAP = {"FM_FLEX": {"F", "M"}, "MD_FLEX": {"M", "D"}}
-
-
-def replacement_ranks_nonflex(
-    roster_positions: list[str], teams: int
-) -> dict[str, int]:
-    base = {"F": 0, "M": 0, "D": 0, "GK": 0}
-    for p in roster_positions:
-        if p in base:
-            base[p] += 1
-    return {k: base[k] * teams for k in base}
-
-
-def effective_replacement_ranks_with_flex(
-    df: pd.DataFrame,
-    pos_col: str,
-    proj_col: str,
-    roster_positions: list[str],
-    teams: int,
-) -> dict[str, int]:
-    base = {"F": 0, "M": 0, "D": 0, "GK": 0}
-    flex_counts = {"FM_FLEX": 0, "MD_FLEX": 0}
-    for p in roster_positions:
-        if p in base:
-            base[p] += 1
-        elif p in flex_counts:
-            flex_counts[p] += 1
-    counts = {k: base[k] * teams for k in base}
-    pools = {}
-    for p in base:
-        vals = (
-            df[df[pos_col] == p]
-            .sort_values(proj_col, ascending=False)[proj_col]
-            .to_list()
-        )
-        pools[p] = vals
-
-    def next_score(p, idx):
-        arr = pools[p]
-        return arr[idx] if idx < len(arr) else float("-inf")
-
-    for _ in range(flex_counts.get("FM_FLEX", 0) * teams):
-        f_score = next_score("F", counts["F"])
-        m_score = next_score("M", counts["M"])
-        counts["F" if f_score >= m_score else "M"] += 1
-    for _ in range(flex_counts.get("MD_FLEX", 0) * teams):
-        m_score = next_score("M", counts["M"])
-        d_score = next_score("D", counts["D"])
-        counts["M" if m_score >= d_score else "D"] += 1
-    return counts
-
-
-def build_vor(board: pd.DataFrame, repl_ranks: dict[str, int]) -> pd.DataFrame:
-    rows = []
-    for pos, k in repl_ranks.items():
-        sub = (
-            board[board["pos"] == pos]
-            .sort_values("proj_points", ascending=False)
-            .reset_index(drop=True)
-        )
-        if len(sub) == 0:
-            continue
-        k = max(1, int(k))
-        repl_points = sub.iloc[min(len(sub) - 1, k - 1)]["proj_points"]
-        sub = sub.copy()
-        sub["replacement_at_rank"] = k
-        sub["replacement_points"] = repl_points
-        sub["VOR"] = sub["proj_points"] - repl_points
-        rows.append(sub)
-    if not rows:
-        return pd.DataFrame(
-            columns=[
-                "web_name",
-                "pos",
-                "team_name",
-                "proj_points",
-                "replacement_at_rank",
-                "replacement_points",
-                "VOR",
-            ]
-        )
-    return pd.concat(rows, ignore_index=True).sort_values("VOR", ascending=False)
+# VOR/replacement-rank logic (roster_requirements, replacement_ranks,
+# effective_replacement_ranks_with_flex, vor_from_ranks) now lives in
+# src/pdh/draft_board.py (Plan C dedup) - imported above.
 
 
 # ----- Name mapping helpers -----
@@ -457,151 +416,150 @@ def subtract_used_slots(req: dict[str, int], used_slots: pd.Series) -> dict[str,
     return r
 
 
-# ---------------------------
-# 1) Name mapping + team ids
-# ---------------------------
-# Build player_full in squads and name link to FBref. Done before the
-# weighted-points build below, since the FPL xG/xA supplement needs
-# squads' player_fbref column already attached.
-squads["player_full"] = (
-    squads["first_name"].astype(str).str.strip()
-    + " "
-    + squads["second_name"].astype(str).str.strip()
-).str.replace(r"\s+", " ", regex=True)
-
-name_link, name_meta = load_or_build_name_link(
-    squads, hist, gw_folder=None, cutoff=0.90
-)
-squads = squads.merge(
-    name_link[["player_full", "player_fbref"]], on="player_full", how="left"
-)
-
-# Ensure numeric team id exists
-squads = ensure_team_id(squads)
-missing_team = squads["team"].isna().sum() if "team" in squads.columns else len(squads)
-if missing_team:
-    print(
-        f"[warn] {missing_team} squad rows have no numeric team id; applying neutral team multipliers for those."
-    )
-
-# ---------------------------
-# 2) Build season-weighted per90 points per player, per position
-# ---------------------------
-# See src/pdh/projections.py for the actual per-90 scoring / team-power /
-# gameweek-projection engine (Plan B extraction from this script).
-try:
-    understat_df = pdh_understat.player_season_stats(cfg_seasons["historical_seasons"])
-    if understat_df.empty:
-        print("[warn] Understat returned no rows (season not started, or soft-blocked); proceeding without xG/xA blending.")
-        understat_df = None
-except Exception as e:
-    print(f"[warn] Understat fetch failed ({e}); proceeding without xG/xA blending.")
-    understat_df = None
-
-# FPL's own expected_goals_per_90/expected_assists_per_90 (bootstrap-static)
-# supplements Understat for the current season - fills gaps where Understat
-# is blocked or a name doesn't link, without needing its own scraper.
-fpl_xg_df = fpl_xg_table(squads, season_end_year=cfg_seasons["current_season_end_year"])
-if fpl_xg_df.empty:
-    fpl_xg_df = None
-
-weighted = build_weighted_points90(
-    hist, weights, scoring, stat_map, understat_df=understat_df, fpl_xg_df=fpl_xg_df
-)
-
-
-# ---------------------------
-# 3) Team power model (attack + defense)
-# ---------------------------
-team_power = build_team_power(team_season_stats, hist, squads, weighted, weights)
-
-# ---------------------------
-# 4) GW setup (event, output dir, name mapping refresh, chance field)
-# ---------------------------
-# choose the GW (event)
-upcoming = fixtures[~fixtures["finished"]].sort_values(["event", "kickoff_time"])
-if args.event is not None:
-    gw = int(args.event)
+if use_cached_projections:
+    # Plan C: skip straight to the taken-filter/ranking step - this is the
+    # only thing that changes pick-to-pick during a live draft. Re-run with
+    # --refresh whenever squads/hist/fixtures data actually changes (e.g.
+    # after re-running update_current.py).
+    players = pd.read_csv(PLAYERS_CACHE_PATH)
+    print(f"[cache] Loaded projections from {PLAYERS_CACHE_PATH} (use --refresh to recompute)")
 else:
-    gw = int(upcoming["event"].min()) if len(upcoming) else int(fixtures["event"].max())
+    # ---------------------------
+    # 1) Name mapping + team ids
+    # ---------------------------
+    # Build player_full in squads and name link to FBref. Done before the
+    # weighted-points build below, since the FPL xG/xA supplement needs
+    # squads' player_fbref column already attached.
+    squads["player_full"] = (
+        squads["first_name"].astype(str).str.strip()
+        + " "
+        + squads["second_name"].astype(str).str.strip()
+    ).str.replace(r"\s+", " ", regex=True)
 
-gw_tag = f"gw{gw}"
-OUTDIR_GW = OUTDIR / gw_tag
-OUTDIR_GW.mkdir(parents=True, exist_ok=True)
-
-# also write the name map so you can audit/override
-name_link_gw, name_meta_gw = load_or_build_name_link(
-    squads, hist, gw_folder=OUTDIR_GW, cutoff=0.90
-)
-
-# If GW curated added more overrides, update mapping on 'squads' too
-if name_meta_gw["curated_overrides"] > name_meta.get("curated_overrides", 0):
-    name_link = name_link_gw
-    squads = squads.drop(columns=["player_fbref"], errors="ignore").merge(
+    name_link, name_meta = load_or_build_name_link(
+        squads, hist, gw_folder=None, cutoff=0.90
+    )
+    squads = squads.merge(
         name_link[["player_full", "player_fbref"]], on="player_full", how="left"
     )
 
-# Write link + missing helpers for this run
-write_name_link_artifacts(OUTDIR_GW, name_link)
+    # Ensure numeric team id exists
+    squads = ensure_team_id(squads)
+    missing_team = squads["team"].isna().sum() if "team" in squads.columns else len(squads)
+    if missing_team:
+        print(
+            f"[warn] {missing_team} squad rows have no numeric team id; applying neutral team multipliers for those."
+        )
 
-# decide which chance field to use
-next_unplayed = int(upcoming["event"].min()) if len(upcoming) else None
-chance_field = (
-    "chance_of_playing_this_round"
-    if (args.event is None or (next_unplayed is not None and gw == next_unplayed))
-    else "chance_of_playing_next_round"
-)
+    # ---------------------------
+    # 2) Build season-weighted per90 points per player, per position
+    # ---------------------------
+    # See src/pdh/projections.py for the actual per-90 scoring / team-power /
+    # gameweek-projection engine (Plan B extraction from this script).
+    try:
+        understat_df = pdh_understat.player_season_stats(cfg_seasons["historical_seasons"])
+        if understat_df.empty:
+            print("[warn] Understat returned no rows (season not started, or soft-blocked); proceeding without xG/xA blending.")
+            understat_df = None
+    except Exception as e:
+        print(f"[warn] Understat fetch failed ({e}); proceeding without xG/xA blending.")
+        understat_df = None
 
-# write team power table
-team_power_rank = team_power.copy()
-team_power_rank["attack_rank"] = (
-    team_power_rank["attack_power"].rank(ascending=False, method="min").astype(int)
-)
-team_power_rank["defense_rank"] = (
-    team_power_rank["defense_power"].rank(ascending=False, method="min").astype(int)
-)
-tp_out = team_power_rank.sort_values("attack_power", ascending=False)[
-    [
-        "team",
-        "team_name",
-        "attack_idx_hist",
-        "defense_idx_hist",
-        "roster_att",
-        "roster_def",
-        "attack_hist_n",
-        "roster_att_n",
-        "defense_hist_n",
-        "roster_def_n",
-        "attack_power",
-        "defense_power",
-        "attack_rank",
-        "defense_rank",
-    ]
-].copy()
+    # FPL's own expected_goals_per_90/expected_assists_per_90 (bootstrap-static)
+    # supplements Understat for the current season - fills gaps where Understat
+    # is blocked or a name doesn't link, without needing its own scraper.
+    fpl_xg_df = fpl_xg_table(squads, season_end_year=cfg_seasons["current_season_end_year"])
+    if fpl_xg_df.empty:
+        fpl_xg_df = None
 
-# purely cosmetic for CSV readability: show 0.0 when raw history is absent (model already treats NaN as neutral)
-tp_out["attack_idx_hist"] = pd.to_numeric(
-    tp_out["attack_idx_hist"], errors="coerce"
-).fillna(0.0)
-tp_out["defense_idx_hist"] = pd.to_numeric(
-    tp_out["defense_idx_hist"], errors="coerce"
-).fillna(0.0)
+    weighted = build_weighted_points90(
+        hist, weights, scoring, stat_map, understat_df=understat_df, fpl_xg_df=fpl_xg_df
+    )
 
-tp_out.to_csv(OUTDIR_GW / "team_power.csv", index=False)
-print(f"Wrote {OUTDIR_GW / 'team_power.csv'}")
+    # ---------------------------
+    # 3) Team power model (attack + defense)
+    # ---------------------------
+    team_power = build_team_power(team_season_stats, hist, squads, weighted, weights)
 
-# ---------------------------
-# 5) Per-GW + multi-week (bench) projections
-# ---------------------------
-players = project_players(
-    squads,
-    weighted,
-    team_power,
-    fixtures,
-    gw,
-    chance_field,
-    weeks_for_bench=args.weeks_for_bench,
-)
+    # ---------------------------
+    # 4) GW setup (name mapping refresh, chance field)
+    # ---------------------------
+    # also write the name map so you can audit/override
+    name_link_gw, name_meta_gw = load_or_build_name_link(
+        squads, hist, gw_folder=OUTDIR_GW, cutoff=0.90
+    )
+
+    # If GW curated added more overrides, update mapping on 'squads' too
+    if name_meta_gw["curated_overrides"] > name_meta.get("curated_overrides", 0):
+        name_link = name_link_gw
+        squads = squads.drop(columns=["player_fbref"], errors="ignore").merge(
+            name_link[["player_full", "player_fbref"]], on="player_full", how="left"
+        )
+
+    # Write link + missing helpers for this run
+    write_name_link_artifacts(OUTDIR_GW, name_link)
+
+    # decide which chance field to use
+    next_unplayed = int(upcoming["event"].min()) if len(upcoming) else None
+    chance_field = (
+        "chance_of_playing_this_round"
+        if (args.event is None or (next_unplayed is not None and gw == next_unplayed))
+        else "chance_of_playing_next_round"
+    )
+
+    # write team power table
+    team_power_rank = team_power.copy()
+    team_power_rank["attack_rank"] = (
+        team_power_rank["attack_power"].rank(ascending=False, method="min").astype(int)
+    )
+    team_power_rank["defense_rank"] = (
+        team_power_rank["defense_power"].rank(ascending=False, method="min").astype(int)
+    )
+    tp_out = team_power_rank.sort_values("attack_power", ascending=False)[
+        [
+            "team",
+            "team_name",
+            "attack_idx_hist",
+            "defense_idx_hist",
+            "roster_att",
+            "roster_def",
+            "attack_hist_n",
+            "roster_att_n",
+            "defense_hist_n",
+            "roster_def_n",
+            "attack_power",
+            "defense_power",
+            "attack_rank",
+            "defense_rank",
+        ]
+    ].copy()
+
+    # purely cosmetic for CSV readability: show 0.0 when raw history is absent (model already treats NaN as neutral)
+    tp_out["attack_idx_hist"] = pd.to_numeric(
+        tp_out["attack_idx_hist"], errors="coerce"
+    ).fillna(0.0)
+    tp_out["defense_idx_hist"] = pd.to_numeric(
+        tp_out["defense_idx_hist"], errors="coerce"
+    ).fillna(0.0)
+
+    tp_out.to_csv(OUTDIR_GW / "team_power.csv", index=False)
+    print(f"Wrote {OUTDIR_GW / 'team_power.csv'}")
+
+    # ---------------------------
+    # 5) Per-GW + multi-week (bench) projections
+    # ---------------------------
+    players = project_players(
+        squads,
+        weighted,
+        team_power,
+        fixtures,
+        gw,
+        chance_field,
+        weeks_for_bench=args.weeks_for_bench,
+    )
+
+    players.to_csv(PLAYERS_CACHE_PATH, index=False)
+    print(f"[cache] Wrote {PLAYERS_CACHE_PATH} (rerun with no --refresh to reuse it)")
 
 
 # ---------------------------
@@ -630,6 +588,31 @@ def write_taken_next(folder: Path, current: list[str], my_new_picks: list[str]) 
     pd.DataFrame({"web_name": merged}).to_csv(path, index=False)
     return path
 
+
+# Auto-populate taken.csv from live Sleeper draft picks, so you don't have
+# to hand-type every opponent's pick during the live draft (see
+# src/pdh/sleeper.py::get_draft_picks/draft_picks_to_web_names). Falls back
+# silently to whatever's already in taken.csv if there's no live draft data
+# yet (pre-draft) or the fetch fails - manual editing still works as before.
+draft_id = sleeper_draft.get("draft_id")
+if draft_id:
+    try:
+        live_picks = get_draft_picks(draft_id)
+    except Exception as e:
+        live_picks = []
+        print(f"[warn] Could not fetch live draft picks ({e}); using taken.csv as-is.")
+    if live_picks:
+        auto_taken = draft_picks_to_web_names(live_picks, normalize_squad_df(squads))
+        if auto_taken:
+            existing = read_taken_csv(OUTDIR_GW)
+            seen, merged = set(), []
+            for n in existing + auto_taken:
+                k = n.lower().strip()
+                if k and k not in seen:
+                    merged.append(n.strip())
+                    seen.add(k)
+            pd.DataFrame({"web_name": merged}).to_csv(OUTDIR_GW / "taken.csv", index=False)
+            print(f"[info] Auto-populated taken.csv from {len(auto_taken)} live draft pick(s).")
 
 taken_names = read_taken_csv(OUTDIR_GW)
 if taken_names:
@@ -682,8 +665,8 @@ board_base = (
 )
 
 # Non-flex
-repl_nonflex = replacement_ranks_nonflex(roster_positions, teams_in_league)
-draft_board_nonflex = build_vor(board_base, repl_nonflex)
+repl_nonflex = replacement_ranks(roster_requirements(roster_positions), teams_in_league)
+draft_board_nonflex = vor_from_ranks(board_base, repl_nonflex)
 draft_board_nonflex.to_csv(OUTDIR_GW / "draft_board_nonflex.csv", index=False)
 
 # Flex-aware
@@ -694,7 +677,7 @@ repl_flex = effective_replacement_ranks_with_flex(
     roster_positions=roster_positions,
     teams=teams_in_league,
 )
-draft_board_flex = build_vor(board_base, repl_flex)
+draft_board_flex = vor_from_ranks(board_base, repl_flex)
 draft_board_flex.to_csv(OUTDIR_GW / "draft_board_flexaware.csv", index=False)
 
 print(f"Wrote {OUTDIR_GW / 'top10.csv'}")
@@ -705,13 +688,6 @@ print(f"Wrote {OUTDIR_GW / 'draft_board_flexaware.csv'}")
 # ---------------------------
 # 9) Top roster planner (stateful, no simulation)
 # ---------------------------
-def roster_requirements(positions: list[str]) -> dict[str, int]:
-    req = {"F": 0, "M": 0, "D": 0, "GK": 0, "FM_FLEX": 0, "MD_FLEX": 0, "BN": 0}
-    for p in positions:
-        req[p] = req.get(p, 0) + 1
-    return req
-
-
 def starters_remaining(req: dict[str, int]) -> int:
     return (
         req.get("F", 0)
@@ -757,7 +733,7 @@ repl_flex = effective_replacement_ranks_with_flex(
     roster_positions=roster_positions,
     teams=teams_in_league,
 )
-draft_board_flex = build_vor(board_base, repl_flex)
+draft_board_flex = vor_from_ranks(board_base, repl_flex)
 
 if "proj_nextN" in board_base.columns:
     name_nextN = board_base[["web_name", "proj_nextN"]].drop_duplicates(
@@ -974,31 +950,35 @@ taken_next_df.to_csv(taken_next_path, index=False)
 print(f"Wrote {taken_next_path}  (rename to {OUTDIR_GW/'taken.csv'} when appropriate)")
 
 # ---- tiny mapping log ----
-unmatched = name_link[name_link["player_fbref"].isna()]
-matched_n = len(name_link) - len(unmatched)
-total_n = len(name_link)
-print(
-    f"[info] Name mapping: {matched_n}/{total_n} matched; {len(unmatched)} unmatched."
-)
-print(
-    f"[info] Curated overrides applied: {name_meta.get('curated_overrides', 0)}"
-    + (
-        f" (+{name_meta_gw.get('curated_overrides', 0) - name_meta.get('curated_overrides', 0)} from GW file)"
-        if "name_meta_gw" in globals()
-        else ""
-    )
-)
-
-if name_meta.get("used_paths"):
-    print("[info] Curated sources:", " | ".join(name_meta["used_paths"]))
-if "name_meta_gw" in globals() and name_meta_gw.get("used_paths"):
-    print("[info] GW curated sources:", " | ".join(name_meta_gw["used_paths"]))
-
-if not unmatched.empty:
+# name_link/name_meta only exist when projections were freshly computed this
+# run (see the use_cached_projections branch above) - nothing new to report
+# on a cached run, since the taken-filter step doesn't touch name-linking.
+if not use_cached_projections:
+    unmatched = name_link[name_link["player_fbref"].isna()]
+    matched_n = len(name_link) - len(unmatched)
+    total_n = len(name_link)
     print(
-        "[info] Unmatched examples:",
-        ", ".join(unmatched["player_full"].head(8).tolist()),
+        f"[info] Name mapping: {matched_n}/{total_n} matched; {len(unmatched)} unmatched."
     )
     print(
-        f"[info] See {OUTDIR_GW/'name_link_missing.csv'} for a full list you can curate."
+        f"[info] Curated overrides applied: {name_meta.get('curated_overrides', 0)}"
+        + (
+            f" (+{name_meta_gw.get('curated_overrides', 0) - name_meta.get('curated_overrides', 0)} from GW file)"
+            if "name_meta_gw" in globals()
+            else ""
+        )
     )
+
+    if name_meta.get("used_paths"):
+        print("[info] Curated sources:", " | ".join(name_meta["used_paths"]))
+    if "name_meta_gw" in globals() and name_meta_gw.get("used_paths"):
+        print("[info] GW curated sources:", " | ".join(name_meta_gw["used_paths"]))
+
+    if not unmatched.empty:
+        print(
+            "[info] Unmatched examples:",
+            ", ".join(unmatched["player_full"].head(8).tolist()),
+        )
+        print(
+            f"[info] See {OUTDIR_GW/'name_link_missing.csv'} for a full list you can curate."
+        )
