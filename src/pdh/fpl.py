@@ -39,6 +39,48 @@ def get_element_summary(player_id: int) -> Dict[str, Any]:
     return _get(f"{BASE}/element-summary/{player_id}/")
 
 
+def current_gameweek() -> int:
+    """
+    The current (in-progress) or next-upcoming FPL gameweek (`events[].id`
+    from bootstrap-static). Preferred over Sleeper's `/v1/state/<sport>` for
+    this league: club-soccer sport semantics are undocumented there, and its
+    `/matchups/<week>` endpoint is confirmed not to work for this league's
+    sport, so bootstrap `events` (already fetched elsewhere in this module)
+    is the reliable source of "what gameweek is it".
+    """
+    events = pd.DataFrame(get_bootstrap()["events"])
+    current = events[events["is_current"]]
+    if len(current):
+        return int(current.iloc[0]["id"])
+    nxt = events[events["is_next"]]
+    if len(nxt):
+        return int(nxt.iloc[0]["id"])
+    finished = events[events["finished"]]
+    if len(finished):
+        return int(finished.iloc[-1]["id"])
+    return int(events["id"].min())
+
+
+def event_live_df(event: int) -> pd.DataFrame:
+    """
+    Per-player stats for gameweek `event` - live if in progress, final once
+    played, empty before kickoff (see `current_gameweek`/bootstrap `events`
+    to check `finished`/`is_current` first). Row per player who has any
+    activity that GW: minutes, total_points, bonus, bps, ict_index, and the
+    per-GW expected_goals/expected_assists. `element_id` matches
+    `current_squads_df()`'s `element_id`, so no name-matching is needed.
+
+    This is the "did they actually play" ground truth for a last-call check,
+    and doubles as a source to backtest src/pdh/projections.py against.
+    """
+    data = _get(f"{BASE}/event/{event}/live/")
+    elements = data.get("elements", [])
+    if not elements:
+        return pd.DataFrame()
+    rows = [{"element_id": e["id"], **e.get("stats", {})} for e in elements]
+    return pd.DataFrame(rows)
+
+
 def current_squads_df() -> pd.DataFrame:
     """Return current season player list with team, position, status, and chance_of_playing flags."""
     boot = get_bootstrap()

@@ -1,7 +1,9 @@
+import argparse
 from pathlib import Path
 import pandas as pd
 import numpy as np
 
+from pdh import fpl
 from pdh.sleeper import (
     get_sleeper_rosters,
     get_sleeper_players,
@@ -12,10 +14,20 @@ from pdh.sleeper import (
 )
 
 # ---------- config ----------
+ap = argparse.ArgumentParser()
+ap.add_argument(
+    "--event",
+    type=int,
+    default=None,
+    help="FPL gameweek (event). If omitted, uses the current/next FPL gameweek.",
+)
+args = ap.parse_args()
+
 project_root = Path(__file__).resolve().parents[1]
 path_data = project_root / "data"
 SEASON = 2526
-GW = 6
+GW = args.event if args.event is not None else fpl.current_gameweek()
+print(f"Using gameweek: {GW}")
 
 formation_map = {
     "3-5-2": {"D": 3, "M": 5, "F": 2},
@@ -302,3 +314,83 @@ print(
         ["web_name", "pos", "proj_points", "proj_nextN", "LOB"]
     ]
 )
+
+# ---------- Last call: confirmed-to-play filter ----------
+# Run this again close to kickoff to catch late fitness news: excludes any
+# chosen starter whose FPL status/chance_of_playing signals they're doubtful
+# or out, and re-picks the formation from confirmed-available players only.
+AVAILABILITY_STATUS_OUT = {"i", "s", "u"}  # injured, suspended, unavailable
+CHANCE_DOUBTFUL_BELOW = 75  # FPL chance_of_playing_this_round, percent
+
+avail = df_squads_norm[["web_name", "status", "chance_of_playing_this_round"]].copy()
+avail["chance_of_playing_this_round"] = pd.to_numeric(
+    avail["chance_of_playing_this_round"], errors="coerce"
+)
+
+
+def _is_doubtful(row) -> bool:
+    if row["status"] in AVAILABILITY_STATUS_OUT:
+        return True
+    chance = row["chance_of_playing_this_round"]
+    return bool(pd.notna(chance) and chance < CHANCE_DOUBTFUL_BELOW)
+
+
+avail["doubtful"] = avail.apply(_is_doubtful, axis=1)
+doubtful_names = set(avail.loc[avail["doubtful"], "web_name"])
+
+chosen_names = set(starters_tagged["web_name"])
+if gk_pick is not None:
+    chosen_names.add(gk_pick["web_name"])
+doubtful_chosen = doubtful_names & chosen_names
+
+if doubtful_chosen:
+    print("\n[last call] Doubtful/out among your chosen starters:")
+    print(
+        avail[avail["web_name"].isin(doubtful_chosen)][
+            ["web_name", "status", "chance_of_playing_this_round"]
+        ]
+    )
+
+    my_board_available = my_board[~my_board["web_name"].isin(doubtful_names)].copy()
+
+    best_name_lc, best_total_lc, best_starters_lc = None, -np.inf, None
+    for name, counts in formation_map.items():
+        starters_lc, total_lc = pick_best_for_formation(
+            my_board_available, counts["D"], counts["M"], counts["F"]
+        )
+        if starters_lc is None:
+            continue
+        if total_lc > best_total_lc:
+            best_name_lc, best_total_lc, best_starters_lc = name, total_lc, starters_lc
+
+    gk_pool_available = gk_pool[~gk_pool["web_name"].isin(doubtful_names)]
+    gk_pick_lc = (
+        gk_pool_available.sort_values("proj_points", ascending=False).iloc[0]
+        if len(gk_pool_available)
+        else None
+    )
+
+    if best_starters_lc is not None:
+        starters_lc_tagged = add_roles(best_starters_lc, best_name_lc)
+        print(
+            f"\n[last call] Alternate formation excluding doubtful/out: {best_name_lc} "
+            f"(sum proj_points={best_total_lc:.2f}, was {best_total:.2f})"
+        )
+        if gk_pick_lc is not None:
+            print(
+                f"[last call] GK: {gk_pick_lc['web_name']} ({gk_pick_lc['team_name']}) "
+                f"— {gk_pick_lc['proj_points']:.2f} pts"
+            )
+        lc_cols = ["role", "web_name", "team_name", "pos", "proj_points"]
+        print(starters_lc_tagged[lc_cols])
+
+        lc_out = path_data / f"season_{SEASON}/game_weeks/gw{GW}/gw{GW}_lastcall.csv"
+        starters_lc_tagged[lc_cols].to_csv(lc_out, index=False)
+        print(f"Saved last-call lineup to: {lc_out}")
+    else:
+        print(
+            "[last call] Not enough confirmed-available players to form any "
+            "formation - check your roster/bench."
+        )
+else:
+    print("\n[last call] No doubtful/out starters detected - original lineup stands.")

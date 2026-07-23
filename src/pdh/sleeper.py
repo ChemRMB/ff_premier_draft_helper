@@ -42,7 +42,6 @@ def _load_league_ids() -> tuple[str, str]:
 
 
 LEAGUE_ID, MY_TEAM_ID = _load_league_ids()
-CURRENT_WEEK = datetime.now().isocalendar()[1]
 
 
 def get_league_info(league_id: str = LEAGUE_ID) -> dict:
