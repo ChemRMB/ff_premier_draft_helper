@@ -12,6 +12,7 @@ dependencies = [
     "scipy>=1.17.1",
     "seleniumbase>=4.35.0",
     "soccerdata>=1.9.0",
+    "streamlit>=1.60.0",
 ]
 
 [build-system]

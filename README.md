@@ -1,8 +1,7 @@
 # Premier Draft Helper (PL + Sleeper)
 
 A Python scaffold to build a draft and weekly recommender for your Sleeper Premier League league.
-It combines **FPL public API** (current squads, fixtures) with **soccerdata** (FBref for broad per-90 stats, Understat for player-level xG/xA) for historical player & team performance, and projects points using your **Sleeper** scoring and roster configuration.
-FotMob was previously listed as a source here, but soccerdata removed its FotMob reader entirely as of 1.9.0 - it's not usable via this library. See `config/scraper_comparison.md` for the full source comparison and decision.
+It combines **FPL public API** (current squads, fixtures) with **soccerdata** (FBref for broad per-90 stats, Understat for player-level xG/xA) for historical player & team performance, and projects points using your **Sleeper** scoring and roster configuration. See `config/scraper_comparison.md` for the full source comparison and decision.
 
 ## Quick start
 
@@ -15,7 +14,11 @@ uv run python scripts/refresh_league_config.py
 # Fetch & cache data + build draft board for GW1 (edit arguments inside the script as needed):
 uv run python scripts/build_historical.py
 uv run python scripts/update_current.py
-uv run python scripts/make_recommendations.py
+uv run python scripts/make_recommendations.py --refresh
+
+# Live snake-draft assistant (best-available/VOR, taken players excluded in
+# real time against the actual Sleeper draft, every team's picks so far):
+uv run streamlit run scripts/streamlit_app.py
 ```
 
 ## What you get
@@ -27,9 +30,11 @@ uv run python scripts/make_recommendations.py
 - `src/pdh/namelink.py` – shared canonical-name + fuzzy + curated-CSV player-name matching, used by both Sleeper<->FPL and FPL<->FBref linking.
 - `src/pdh/normalize.py` – standardize player stats (per-90, tidy columns, join across tables).
 - `src/pdh/scoring.py` – loads Sleeper scoring, maps stat names (editable in `config/stat_map.yaml`), computes fantasy points.
-- `src/pdh/recommend.py` – season-weighted player rates, fixture difficulty adjustment, GW projections.
+- `src/pdh/projections.py` – season-weighted per-90 rates (with Understat/FPL xG-xA blending), team attack/defense power, GW point projections.
 - `src/pdh/draft_board.py` – VOR (value over replacement) ranks by position given your snake-draft roster settings.
-- `scripts/*.py` – runnable pipeline: `refresh_league_config.py`, `compare_scrapers.py`, `build_historical.py`, `update_current.py`, `make_recommendations.py`, `recommend_formation.py`.
+- `src/pdh/stickiness.py` – which players are reliable/outlier enough that trade suggestions should never offer them away (Plan D).
+- `src/pdh/webapp/data.py` – data-loading layer for the Streamlit app; reads existing pipeline outputs, doesn't recompute anything.
+- `scripts/*.py` – runnable pipeline: `refresh_league_config.py`, `compare_scrapers.py`, `build_historical.py`, `update_current.py`, `make_recommendations.py`, `recommend_formation.py`, `weekly_lineup.py`, `suggest_name_links.py` (suggests FBref matches for unmatched FPL players to speed up curating `config/name_link_curated.csv`), `streamlit_app.py`.
 
 ## Configure
 
@@ -39,11 +44,9 @@ uv run python scripts/make_recommendations.py
 
 ## Data outputs
 
-- `data/outputs/players_historical.csv` – player-match rows (last 3 seasons) with normalized stats.
-- `data/outputs/current_squads.csv` – current season players (FPL) with status/positions.
-- `data/outputs/fixtures.csv` – all fixtures this season with GW (event) tags.
-- `data/outputs/draft_board.csv` – ranked list for draft (with VOR).
-- `data/outputs/gw_top10.csv` – weekly top 10 suggestions overall and by position.
+- `data/historical/players_historical_*.csv` / `teams_season_stats.csv` – player-match rows and team season stats (from `build_historical.py`).
+- `data/season_2526/current_squads.csv`, `fixtures.csv`, `players_taken.csv` – current-season snapshot (from `update_current.py`).
+- `data/season_2526/game_weeks/gwN/` – per-gameweek outputs from `make_recommendations.py`: `draft_board_flexaware.csv`/`draft_board_nonflex.csv` (ranked, with VOR), `top10.csv` (overall + per position), `players_projected_cache.csv` (cached projections - see `--refresh`), `taken.csv`/`snake_state.csv` (live draft state, auto-populated from the real Sleeper draft), `top_roster.csv`, `snake_plan.csv`.
 
 ## Licenses & ToS
 
