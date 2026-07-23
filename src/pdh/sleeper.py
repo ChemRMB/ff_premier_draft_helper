@@ -69,6 +69,41 @@ def get_league_drafts(league_id: str = LEAGUE_ID) -> list[dict]:
     return response.json()
 
 
+def get_player_week_stats(season: int, week: int, sport: str = "clubsoccer:epl") -> pd.DataFrame:
+    """
+    Fetch Sleeper's own raw per-player stats and precomputed standard fantasy
+    points (`pts_std`) for one completed gameweek - the same numbers the
+    Sleeper app shows for "how each player scored". Undocumented endpoint
+    (docs.sleeper.com is NFL-only) but confirmed working for club soccer;
+    data is sourced from Opta per the `company` field on the season-level
+    endpoint. Keyed by Sleeper `player_id` - no name-matching needed, unlike
+    FBref/Understat.
+
+    Ground truth for backtesting src/pdh/projections.py: compare `pts_std`
+    here against `proj_points` for the same week to check model accuracy.
+    """
+    url = f"https://api.sleeper.app/v1/stats/{sport}/regular/{season}/{week}"
+    response = requests.get(url)
+    response.raise_for_status()
+    data = response.json()
+    return pd.DataFrame(data).T.reset_index(names="player_id")
+
+
+def get_player_season_stats(season: int, sport: str = "clubsoccer:epl") -> pd.DataFrame:
+    """
+    Fetch Sleeper's own raw per-player season totals and precomputed standard
+    fantasy points (`pts_std`)/rank (`rank_std`) - same source/caveats as
+    get_player_week_stats. Returns one row per player with `stats` flattened
+    into columns.
+    """
+    url = f"https://api.sleeper.app/stats/{sport}/{season}"
+    response = requests.get(url, params={"season_type": "regular"})
+    response.raise_for_status()
+    rows = response.json()
+    out = pd.json_normalize(rows, sep="_")
+    return out
+
+
 def refresh_league_config(
     league_id: str,
     my_team_id: str,

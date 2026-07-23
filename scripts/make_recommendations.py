@@ -13,8 +13,10 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from pdh.scoring import load_sleeper_scoring, load_stat_map, points_from_row
+from pdh.scoring import load_sleeper_scoring, load_stat_map
 from pdh import fpl  # used to fetch FPL team ids if missing
+from pdh.projections import build_weighted_points90, build_team_power, project_players
+from pdh import understat as pdh_understat
 
 
 # ---------------------------
@@ -87,96 +89,9 @@ fixtures = pd.read_csv(
 # ---------------------------
 # Helpers
 # ---------------------------
-POS_FPL_TO_GENERAL = {"GK": "GK", "DEF": "D", "MID": "M", "FWD": "F"}
-POS_ALIAS = {
-    "GKP": "GK",
-    "GK": "GK",
-    "GOALKEEPER": "GK",
-    "KEEPER": "GK",
-    "DEF": "D",
-    "D": "D",
-    "CB": "D",
-    "LB": "D",
-    "RB": "D",
-    "WB": "D",
-    "MID": "M",
-    "M": "M",
-    "AM": "M",
-    "CM": "M",
-    "DM": "M",
-    "LM": "M",
-    "RM": "M",
-    "FWD": "F",
-    "FW": "F",
-    "ST": "F",
-    "CF": "F",
-    "LW": "F",
-    "RW": "F",
-    "ATT": "F",
-    "F": "F",
-}
-STATUS_MULT = {"a": 1.00, "d": 0.65, "i": 0.00, "s": 0.00, "u": 0.00}
-POS_PRIOR = {"GK": 90.0, "D": 80.0, "M": 75.0, "F": 75.0}
+# Position/team constants, per-90 scoring, team power model, and gameweek
+# projection logic now live in src/pdh/projections.py (Plan B extraction).
 FLEX_MAP = {"FM_FLEX": {"F", "M"}, "MD_FLEX": {"M", "D"}}
-
-# FBref "team" → FPL "team_name" (canonical)
-ALIAS_FBREF_TO_FPL = {
-    # exact long ↔ short
-    "Manchester United": "Man Utd",
-    "Man United": "Man Utd",
-    "Manchester Utd": "Man Utd",
-    "Manchester City": "Man City",
-    "Tottenham Hotspur": "Spurs",
-    "Tottenham": "Spurs",
-    "West Ham United": "West Ham",
-    "Wolverhampton Wanderers": "Wolves",
-    "Wolverhampton": "Wolves",
-    "Nottingham Forest": "Nott'm Forest",
-    "Newcastle United": "Newcastle",
-    "Leeds United": "Leeds",
-    "Brighton & Hove Albion": "Brighton",
-    "Brighton and Hove Albion": "Brighton",
-    "Sheffield United": "Sheffield Utd",
-    "Leicester City": "Leicester",
-    "Luton Town": "Luton",
-    "Ipswich Town": "Ipswich",
-    # identities (won't hurt)
-    "Arsenal": "Arsenal",
-    "Aston Villa": "Aston Villa",
-    "Bournemouth": "Bournemouth",
-    "Brentford": "Brentford",
-    "Burnley": "Burnley",
-    "Chelsea": "Chelsea",
-    "Crystal Palace": "Crystal Palace",
-    "Everton": "Everton",
-    "Fulham": "Fulham",
-    "Liverpool": "Liverpool",
-    "Newcastle": "Newcastle",
-    "Spurs": "Spurs",
-    "Man Utd": "Man Utd",
-    "Man City": "Man City",
-    "West Ham": "West Ham",
-    "Wolves": "Wolves",
-    "Leeds": "Leeds",
-    "Brighton": "Brighton",
-}
-
-
-def to_canon_pos(x):
-    if pd.isna(x):
-        return None
-    t = str(x).upper().strip()
-    return POS_ALIAS.get(t, t if t in ("F", "M", "D", "GK") else None)
-
-
-def attack_mult(diff):  # For F & M
-    d = int(diff) if pd.notna(diff) else 3
-    return {2: 1.10, 3: 1.00, 4: 0.93, 5: 0.85}.get(d, 1.00)
-
-
-def defend_mult(diff):  # For D & GK
-    d = int(diff) if pd.notna(diff) else 3
-    return {2: 1.10, 3: 1.00, 4: 0.93, 5: 0.88}.get(d, 1.00)
 
 
 def replacement_ranks_nonflex(
@@ -258,21 +173,6 @@ def build_vor(board: pd.DataFrame, repl_ranks: dict[str, int]) -> pd.DataFrame:
             ]
         )
     return pd.concat(rows, ignore_index=True).sort_values("VOR", ascending=False)
-
-
-def coalesce_minutes_rowwise(df: pd.DataFrame) -> pd.Series:
-    cands = [
-        "summary_min",
-        "passing_min",
-        "defense_min",
-        "possession_min",
-        "misc_min",
-        "keepers_min",
-    ]
-    avail = [c for c in cands if c in df.columns]
-    if not avail:
-        return pd.Series(np.nan, index=df.index)
-    return df[avail].bfill(axis=1).iloc[:, 0]
 
 
 # ----- Name mapping helpers -----
@@ -555,51 +455,18 @@ def subtract_used_slots(req: dict[str, int], used_slots: pd.Series) -> dict[str,
 # ---------------------------
 # 1) Build season-weighted per90 points per player, per position
 # ---------------------------
-if "minutes" not in hist.columns:
-    hist["minutes"] = coalesce_minutes_rowwise(hist)
-per90_cols = [c for c in hist.columns if c.endswith("_p90")]
+# See src/pdh/projections.py for the actual per-90 scoring / team-power /
+# gameweek-projection engine (Plan B extraction from this script).
+try:
+    understat_df = pdh_understat.player_season_stats(cfg_seasons["historical_seasons"])
+    if understat_df.empty:
+        print("[warn] Understat returned no rows (season not started, or soft-blocked); proceeding without xG/xA blending.")
+        understat_df = None
+except Exception as e:
+    print(f"[warn] Understat fetch failed ({e}); proceeding without xG/xA blending.")
+    understat_df = None
 
-# collapse to player-season average per90
-per_season = hist.groupby(["player", "season"])[per90_cols].mean().reset_index()
-
-# season-weighted minutes baseline (vectorized)
-mins_per_season = hist.groupby(["player", "season"])["minutes"].mean().reset_index()
-mins_tmp = mins_per_season.copy()
-mins_tmp["_w"] = mins_tmp["season"].astype(str).map(weights).fillna(1.0)
-den_m = mins_tmp.groupby("player")["_w"].sum()
-num_m = (mins_tmp["minutes"] * mins_tmp["_w"]).groupby(mins_tmp["player"]).sum()
-min_weighted = (num_m / den_m).rename("hist_minutes_w").reset_index()
-
-
-# per-season per90 points using Sleeper scoring + stat_map
-def score_row_per90(row: pd.Series, position: str) -> float:
-    base = {c[:-4]: row[c] for c in per90_cols if pd.notna(row[c])}
-    return points_from_row(pd.Series(base), position, scoring, stat_map)
-
-
-for pos in ["F", "M", "D", "GK"]:
-    per_season[f"points90_{pos}"] = per_season.apply(
-        lambda r: score_row_per90(r, pos), axis=1
-    )
-
-agg = per_season.copy()
-agg["_w"] = agg["season"].astype(str).map(weights).fillna(1.0)
-den = agg.groupby("player")["_w"].sum()
-
-
-def wmean(col: str) -> pd.Series:
-    return (agg[col] * agg["_w"]).groupby(agg["player"]).sum() / den
-
-
-weighted = pd.DataFrame(
-    {
-        "player": den.index,
-        "points90w_F": wmean("points90_F").reindex(den.index).values,
-        "points90w_M": wmean("points90_M").reindex(den.index).values,
-        "points90w_D": wmean("points90_D").reindex(den.index).values,
-        "points90w_GK": wmean("points90_GK").reindex(den.index).values,
-    }
-).merge(min_weighted, on="player", how="left")
+weighted = build_weighted_points90(hist, weights, scoring, stat_map, understat_df=understat_df)
 
 
 # ---------------------------
@@ -631,341 +498,11 @@ if missing_team:
 # ---------------------------
 # 3) Team power model (attack + defense)
 # ---------------------------
-# Attack features (team_season_stats)
-ATT_FEATURES_CAND = [
-    "Progression_PrgC",
-    "Progression_PrgP",
-    "Per 90 Minutes_Gls",
-    "Per 90 Minutes_Ast",
-    "Per 90 Minutes_G+A",
-    "Per 90 Minutes_G-PK",
-    "Per 90 Minutes_G+A-PK",
-    "Per 90 Minutes_xG",
-    "Per 90 Minutes_xAG",
-    "Per 90 Minutes_xG+xAG",
-    "Per 90 Minutes_npxG",
-    "Per 90 Minutes_npxG+xAG",
-]
-ts = team_season_stats.copy()
-ts = ts.dropna(subset=["team", "season"])
-att_cols = [c for c in ATT_FEATURES_CAND if c in ts.columns]
-for c in att_cols:
-    ts[c] = pd.to_numeric(ts[c], errors="coerce")
+team_power = build_team_power(team_season_stats, hist, squads, weighted, weights)
 
-
-def _zscore_per_season(df, cols, invert: bool = False, label="idx"):
-    out = df.copy()
-    if not cols:
-        out[label] = 0.0
-        return out[["team", "season", label]]
-    for c in cols:
-        mu = out[c].mean()
-        sd = out[c].std(ddof=0)
-        if sd == 0 or np.isnan(sd):
-            out[c + "_z"] = 0.0
-        else:
-            z = (out[c] - mu) / sd
-            out[c + "_z"] = (-z) if invert else z
-    zcols = [c + "_z" for c in cols]
-    out[f"{label}"] = out[zcols].mean(axis=1)
-    return out[["team", "season", label]]
-
-
-ts_att_idx = _zscore_per_season(
-    ts[["team", "season"] + att_cols], att_cols, invert=False, label="attack_idx_season"
-)
-# Weighted attack history
-tmpa = ts_att_idx.copy()
-tmpa["_w"] = tmpa["season"].astype(str).map(weights).fillna(1.0)
-den_att = tmpa.groupby("team")["_w"].sum()
-num_att = (tmpa["attack_idx_season"] * tmpa["_w"]).groupby(tmpa["team"]).sum()
-team_attack_hist = (num_att / den_att).rename("attack_idx_hist").reset_index()
-
-# Defense index from GK logs in hist (GA/90 low good; CS rate high good)
-gk_mask = pd.Series(False, index=hist.index)
-if "keepers_min" in hist.columns:
-    gk_mask = gk_mask | hist["keepers_min"].notna()
-for col in ["keepers_Shot Stopping_Saves", "keepers_Shot Stopping_GA"]:
-    if col in hist.columns:
-        gk_mask = gk_mask | hist[col].notna()
-gk = hist[gk_mask].copy()
-gk["minutes"] = gk["minutes"].fillna(0)
-for need in ["goals_conceded", "clean_sheet"]:
-    if need not in gk.columns:
-        gk[need] = np.nan
-
-
-def _agg_team_season_def(grp: pd.DataFrame) -> pd.Series:
-    mins = grp["minutes"].sum()
-    ga = grp["goals_conceded"].sum(min_count=1)
-    if "game_id" in grp.columns:
-        n_matches = grp["game_id"].nunique()
-    else:
-        n_matches = len(grp)
-    cs = grp["clean_sheet"].sum(min_count=1)
-    ga_p90 = np.nan
-    if pd.notna(ga) and mins > 0:
-        ga_p90 = ga / (mins / 90.0)
-    cs_rate = np.nan
-    if pd.notna(cs) and n_matches > 0:
-        cs_rate = cs / n_matches
-    return pd.Series({"ga_p90": ga_p90, "cs_rate": cs_rate})
-
-
-def_df = (
-    gk.groupby(["team", "season"], dropna=False)
-    .apply(_agg_team_season_def, include_groups=False)
-    .reset_index()
-)
-for c in ["ga_p90", "cs_rate"]:
-    def_df[c] = pd.to_numeric(def_df[c], errors="coerce")
-mu_ga, sd_ga = def_df["ga_p90"].mean(), def_df["ga_p90"].std(ddof=0)
-mu_cs, sd_cs = def_df["cs_rate"].mean(), def_df["cs_rate"].std(ddof=0)
-def_df["ga_p90_z"] = (
-    0.0 if (sd_ga == 0 or np.isnan(sd_ga)) else (mu_ga - def_df["ga_p90"]) / sd_ga
-)
-def_df["cs_rate_z"] = (
-    0.0 if (sd_cs == 0 or np.isnan(sd_cs)) else (def_df["cs_rate"] - mu_cs) / sd_cs
-)
-def_df["defense_idx_season"] = def_df[["ga_p90_z", "cs_rate_z"]].mean(axis=1)
-tmpd = def_df.copy()
-tmpd["_w"] = tmpd["season"].astype(str).map(weights).fillna(1.0)
-den_def = tmpd.groupby("team")["_w"].sum()
-num_def = (tmpd["defense_idx_season"] * tmpd["_w"]).groupby(tmpd["team"]).sum()
-team_defense_hist = (num_def / den_def).rename("defense_idx_hist").reset_index()
-
-
-# Canonicalize FBref names to FPL style up front
-fb_att = team_attack_hist.copy()
-fb_def = team_defense_hist.copy()
-fb_att["team_fpl_like"] = fb_att["team"].map(ALIAS_FBREF_TO_FPL).fillna(fb_att["team"])
-fb_def["team_fpl_like"] = fb_def["team"].map(ALIAS_FBREF_TO_FPL).fillna(fb_def["team"])
-
-# Unique current FPL teams
-team_names_fpl = squads[["team", "team_name"]].drop_duplicates().copy()
-
-# 1) Direct join on canonical strings (case-insensitive safe via lower)
-fb_att["_join"] = fb_att["team_fpl_like"].str.lower()
-fb_def["_join"] = fb_def["team_fpl_like"].str.lower()
-team_names_fpl["_join"] = team_names_fpl["team_name"].str.lower()
-
-team_power = (
-    team_names_fpl.merge(fb_att[["_join", "attack_idx_hist"]], on="_join", how="left")
-    .merge(fb_def[["_join", "defense_idx_hist"]], on="_join", how="left")
-    .drop(columns=["_join"])
-    .drop_duplicates(subset=["team", "team_name"])
-)
-
-# 2) Fuzzy fallback for any still-missing rows (compare FPL name vs fb_att/def team_fpl_like)
-need_attack = team_power["attack_idx_hist"].isna()
-need_def = team_power["defense_idx_hist"].isna()
-
-if need_attack.any() or need_def.any():
-    fb_att_cands = (
-        fb_att[["team_fpl_like", "attack_idx_hist"]].dropna().drop_duplicates()
-    )
-    fb_def_cands = (
-        fb_def[["team_fpl_like", "defense_idx_hist"]].dropna().drop_duplicates()
-    )
-    fuzzy_hits = []
-
-    def _fuzzy_pick(name: str, cands: pd.DataFrame, col: str, cutoff=0.78):
-        if cands.empty:
-            return np.nan, None, 0.0
-        pool = cands["team_fpl_like"].tolist()
-        best = difflib.get_close_matches(name, pool, n=1, cutoff=cutoff)
-        if not best:
-            return np.nan, None, 0.0
-        best_name = best[0]
-        score = difflib.SequenceMatcher(None, name, best_name).ratio()
-        val = cands.loc[cands["team_fpl_like"] == best_name, col].iloc[0]
-        return val, best_name, score
-
-    tp = team_power.copy()
-    for idx, row in tp.iterrows():
-        tname = str(row["team_name"])
-        if need_attack.iloc[idx]:
-            val, cand, sc = _fuzzy_pick(
-                tname, fb_att_cands, "attack_idx_hist", cutoff=0.78
-            )
-            if pd.notna(val):
-                tp.at[idx, "attack_idx_hist"] = val
-                fuzzy_hits.append(
-                    f"[fuzzy-attack] '{tname}' -> '{cand}' (score={sc:.2f})"
-                )
-        if need_def.iloc[idx]:
-            val, cand, sc = _fuzzy_pick(
-                tname, fb_def_cands, "defense_idx_hist", cutoff=0.78
-            )
-            if pd.notna(val):
-                tp.at[idx, "defense_idx_hist"] = val
-                fuzzy_hits.append(
-                    f"[fuzzy-defense] '{tname}' -> '{cand}' (score={sc:.2f})"
-                )
-    team_power = tp
-
-    if fuzzy_hits:
-        print("\n".join(fuzzy_hits))
-
-# Current roster strengths (attack/defense)
-roster_tbl = squads.copy()
-roster_tbl["pos"] = roster_tbl["pos"].map(POS_FPL_TO_GENERAL).fillna(roster_tbl["pos"])
-roster_tbl["pos"] = roster_tbl["pos"].apply(to_canon_pos)
-roster_tbl = roster_tbl.merge(
-    weighted[["player", "points90w_F", "points90w_M", "points90w_D", "points90w_GK"]],
-    left_on="player_fbref",
-    right_on="player",
-    how="left",
-)
-roster_tbl["points90w_sel"] = np.where(
-    roster_tbl["pos"].eq("F"),
-    roster_tbl["points90w_F"],
-    np.where(
-        roster_tbl["pos"].eq("M"),
-        roster_tbl["points90w_M"],
-        np.where(
-            roster_tbl["pos"].eq("D"),
-            roster_tbl["points90w_D"],
-            np.where(
-                roster_tbl["pos"].eq("GK"),
-                roster_tbl["points90w_GK"],
-                roster_tbl["points90w_M"],
-            ),
-        ),
-    ),
-)
-ROSTER_TOP_N_ATT = 10
-ROSTER_TOP_N_DEF = 10
-roster_att = (
-    roster_tbl[roster_tbl["pos"].isin(["F", "M"])]
-    .dropna(subset=["team_name", "points90w_sel"])
-    .sort_values(["team_name", "points90w_sel"], ascending=[True, False])
-    .groupby("team_name")
-    .head(ROSTER_TOP_N_ATT)
-    .groupby("team_name")["points90w_sel"]
-    .sum()
-    .rename("roster_att")
-    .reset_index()
-)
-roster_tbl["points90w_def_component"] = np.where(
-    roster_tbl["pos"].eq("GK"),
-    roster_tbl["points90w_GK"] * 1.2,
-    np.where(roster_tbl["pos"].eq("D"), roster_tbl["points90w_D"], 0.0),
-)
-roster_def = (
-    roster_tbl[roster_tbl["pos"].isin(["D", "GK"])]
-    .dropna(subset=["team_name", "points90w_def_component"])
-    .sort_values(["team_name", "points90w_def_component"], ascending=[True, False])
-    .groupby("team_name")
-    .head(ROSTER_TOP_N_DEF)
-    .groupby("team_name")["points90w_def_component"]
-    .sum()
-    .rename("roster_def")
-    .reset_index()
-)
-
-team_power = team_power.merge(roster_att, on="team_name", how="left").merge(
-    roster_def, on="team_name", how="left"
-)
-
-
-def _norm_mean1(s: pd.Series) -> pd.Series:
-    s = pd.to_numeric(s, errors="coerce")
-    mu = s.mean()
-    if mu == 0 or np.isnan(mu):
-        return s.fillna(0.0).apply(lambda x: 1.0)
-    return (s / mu).replace([np.inf, -np.inf], 1.0).fillna(1.0)
-
-
-def _winsor_mean1_shrink(
-    s: pd.Series,
-    p_lo=0.10,
-    p_hi=0.90,
-    shrink=0.5,
-    final_clip: tuple[float, float] | None = (0.90, 1.10),
-) -> pd.Series:
-    """
-    Winsorize to [p_lo, p_hi] percentiles, normalize to mean=1, then shrink toward 1.
-    Optionally apply a light final clip.
-    """
-    x = pd.to_numeric(s, errors="coerce").copy()
-    lo = x.quantile(p_lo)
-    hi = x.quantile(p_hi)
-    x = x.clip(lo, hi)
-    mu = x.mean()
-    if not np.isfinite(mu) or mu == 0:
-        x = x.fillna(1.0)
-        mu = 1.0
-    x = x / mu  # mean ~ 1.0
-    x = 1.0 + shrink * (x - 1.0)  # shrink toward 1.0
-    if final_clip:
-        lo_c, hi_c = final_clip
-        x = x.clip(lo_c, hi_c)
-    return x.fillna(1.0)
-
-
-ALPHA_HIST = 0.2  # historical performance weight
-ALPHA_ROS = 0.8  # current roster strength weight
-
-team_power["attack_hist_n"] = _norm_mean1(team_power["attack_idx_hist"])
-team_power["roster_att_n"] = _norm_mean1(team_power["roster_att"])
-team_power["defense_hist_n"] = _norm_mean1(team_power["defense_idx_hist"])
-team_power["roster_def_n"] = _norm_mean1(team_power["roster_def"])
-
-
-# 1) Normalize inputs to be ~mean=1
-for c in ["attack_idx_hist", "defense_idx_hist", "roster_att", "roster_def"]:
-    team_power[c] = pd.to_numeric(team_power[c], errors="coerce")
-
-att_hist_n = _norm_mean1(team_power["attack_idx_hist"]).fillna(1.0)
-ros_att_n = _norm_mean1(team_power["roster_att"]).fillna(1.0)
-def_hist_n = _norm_mean1(team_power["defense_idx_hist"]).fillna(1.0)
-ros_def_n = _norm_mean1(team_power["roster_def"]).fillna(1.0)
-
-# 2) Blend
-att_blend = ALPHA_HIST * att_hist_n + ALPHA_ROS * ros_att_n
-def_blend = ALPHA_HIST * def_hist_n + ALPHA_ROS * ros_def_n
-
-team_power["attack_power"] = att_blend
-team_power["defense_power"] = def_blend
-
-# 3) Winsorize + mean-1 + shrink (no edge pinning)
-# team_power["attack_power"] = _winsor_mean1_shrink(
-#     att_blend,
-#     p_lo=0.10,
-#     p_hi=0.90,
-#     shrink=0.6,  # final_clip=(0.92, 1.08)
-# )
-# team_power["defense_power"] = _winsor_mean1_shrink(
-#     def_blend,
-#     p_lo=0.10,
-#     p_hi=0.90,
-#     shrink=0.6,  # final_clip=(0.92, 1.08)
-# )
-for label, col in [
-    ("attack_power", "attack_power"),
-    ("defense_power", "defense_power"),
-]:
-    x = team_power[col]
-    print(
-        f"[dbg] {label}: min={x.min():.3f}, p10={x.quantile(0.10):.3f}, "
-        f"median={x.median():.3f}, p90={x.quantile(0.90):.3f}, max={x.max():.3f}, mean={x.mean():.3f}"
-    )
-
-dbg_missing = team_power[
-    team_power["attack_idx_hist"].isna() | team_power["defense_idx_hist"].isna()
-]
-if not dbg_missing.empty:
-    print(
-        "[debug] still missing history for:",
-        ", ".join(dbg_missing["team_name"].tolist()),
-    )
 # ---------------------------
-# 4) Merge weighted with squads, GW setup & team power mapping
+# 4) GW setup (event, output dir, name mapping refresh, chance field)
 # ---------------------------
-squads["pos"] = squads["pos"].map(POS_FPL_TO_GENERAL).fillna(squads["pos"])
-players = squads.merge(weighted, left_on="player_fbref", right_on="player", how="left")
-
 # choose the GW (event)
 upcoming = fixtures[~fixtures["finished"]].sort_values(["event", "kickoff_time"])
 if args.event is not None:
@@ -999,39 +536,6 @@ chance_field = (
     if (args.event is None or (next_unplayed is not None and gw == next_unplayed))
     else "chance_of_playing_next_round"
 )
-
-# GW difficulty map
-gw_fix = fixtures[fixtures["event"] == gw].copy()
-team_diff = {}
-for _, r in gw_fix.iterrows():
-    team_diff[int(r["team_h"])] = int(r["team_h_difficulty"])
-    team_diff[int(r["team_a"])] = int(r["team_a_difficulty"])
-
-# ensure team id if still missing (rare)
-if "team" not in players.columns or players["team"].isna().all():
-    boot = fpl.get_bootstrap()
-    teams_df = pd.DataFrame(boot["teams"])[["id", "name", "short_name"]]
-    players = players.merge(
-        teams_df.rename(columns={"id": "team"}),
-        left_on="team_name",
-        right_on="name",
-        how="left",
-    )
-
-players["gw_difficulty"] = players["team"].map(team_diff)
-
-# Map team powers, keep a single clean team_name
-players = players.merge(
-    team_power[["team", "team_name", "attack_power", "defense_power"]],
-    on="team",
-    how="left",
-    suffixes=("", "_tp"),
-)
-if "team_name_tp" in players.columns:
-    players["team_name"] = players["team_name"].fillna(players["team_name_tp"])
-    players.drop(columns=["team_name_tp"], inplace=True)
-players["attack_power"] = players["attack_power"].fillna(1.0)
-players["defense_power"] = players["defense_power"].fillna(1.0)
 
 # write team power table
 team_power_rank = team_power.copy()
@@ -1071,124 +575,18 @@ tp_out["defense_idx_hist"] = pd.to_numeric(
 tp_out.to_csv(OUTDIR_GW / "team_power.csv", index=False)
 print(f"Wrote {OUTDIR_GW / 'team_power.csv'}")
 
-# Normalize positions to F/M/D/GK
-players["pos"] = players["pos"].apply(to_canon_pos)
-
-
-# expected minutes: hist baseline × status × chance
-def exp_minutes(row):
-    base = row.get("hist_minutes_w", np.nan)
-    if pd.isna(base):
-        base = POS_PRIOR.get(row.get("pos"), 75.0)
-    status = str(row.get("status", "")).lower()
-    sm = STATUS_MULT.get(status, 0.80 if status == "" else 0.0)
-    cp = row.get(chance_field, np.nan)
-    cm = float(cp) / 100.0 if pd.notna(cp) else 0.50
-    est = base * sm * cm
-    return float(max(0.0, min(90.0, est)))
-
-
-players["exp_minutes"] = players.apply(exp_minutes, axis=1)
-
-
 # ---------------------------
-# 5) Per-GW projection
+# 5) Per-GW + multi-week (bench) projections
 # ---------------------------
-players["points90w_sel"] = np.where(
-    players["pos"].eq("F"),
-    players["points90w_F"],
-    np.where(
-        players["pos"].eq("M"),
-        players["points90w_M"],
-        np.where(
-            players["pos"].eq("D"),
-            players["points90w_D"],
-            np.where(
-                players["pos"].eq("GK"), players["points90w_GK"], players["points90w_M"]
-            ),
-        ),
-    ),
+players = project_players(
+    squads,
+    weighted,
+    team_power,
+    fixtures,
+    gw,
+    chance_field,
+    weeks_for_bench=args.weeks_for_bench,
 )
-
-
-def proj_points_row(r):
-    pos = r["pos"]
-    if pos not in ("F", "M", "D", "GK"):
-        return 0.0
-    points90 = float(r["points90w_sel"])
-    minutes = float(r.get("exp_minutes", 0.0))
-    diff = r.get("gw_difficulty", 3)
-    mult_pos = attack_mult(diff) if pos in ("F", "M") else defend_mult(diff)
-    mult_team = (
-        float(r.get("attack_power", 1.0))
-        if pos in ("F", "M")
-        else float(r.get("defense_power", 1.0))
-    )
-    return points90 * (minutes / 90.0) * mult_pos * mult_team
-
-
-players["proj_points"] = players.apply(proj_points_row, axis=1)
-
-
-# ---------------------------
-# 5b) Multi-week projection for bench planning
-# ---------------------------
-def event_team_difficulty_map(event: int) -> dict[int, int]:
-    fx = fixtures[fixtures["event"] == event]
-    td = {}
-    for _, r in fx.iterrows():
-        td[int(r["team_h"])] = int(r["team_h_difficulty"])
-        td[int(r["team_a"])] = int(r["team_a_difficulty"])
-    return td
-
-
-def proj_for_event(df: pd.DataFrame, event: int) -> pd.Series:
-    td = event_team_difficulty_map(event)
-    pos_vals = df["pos"].fillna("M").to_numpy()
-    diffs = df["team"].map(td).to_numpy()
-    mins = df["exp_minutes"].to_numpy()
-    pts90 = np.where(
-        pos_vals == "F",
-        df["points90w_F"].to_numpy(),
-        np.where(
-            pos_vals == "M",
-            df["points90w_M"].to_numpy(),
-            np.where(
-                pos_vals == "D",
-                df["points90w_D"].to_numpy(),
-                np.where(
-                    pos_vals == "GK",
-                    df["points90w_GK"].to_numpy(),
-                    df["points90w_M"].to_numpy(),
-                ),
-            ),
-        ),
-    )
-    mult_pos = np.array(
-        [
-            attack_mult(d) if p in ("F", "M") else defend_mult(d)
-            for d, p in zip(diffs, pos_vals)
-        ]
-    )
-    mult_team = np.where(
-        np.isin(pos_vals, ["F", "M"]),
-        df["attack_power"].fillna(1.0).to_numpy(),
-        df["defense_power"].fillna(1.0).to_numpy(),
-    )
-    return pd.Series(pts90 * (mins / 90.0) * mult_pos * mult_team, index=df.index)
-
-
-# initialize nextN to current
-players["proj_nextN"] = players["proj_points"].astype(float)
-future_events = [e for e in range(gw, gw + args.weeks_for_bench)]
-acc = pd.Series(0.0, index=players.index, dtype="float64")
-denN = 0
-for e in future_events:
-    if (fixtures["event"] == e).any():
-        acc = acc.add(proj_for_event(players, e), fill_value=0.0)
-        denN += 1
-if denN > 0:
-    players["proj_nextN"] = acc / denN
 
 
 # ---------------------------

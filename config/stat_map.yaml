@@ -4,6 +4,8 @@
 forwards:
   g: goals
   at: assists         # if you prefer assists points for F too
+  xg: expected_goals   # Understat xG - not scored by Sleeper directly, but blended into `goals` per-90 rates (see projections.build_weighted_points90) for more stable projections
+  xa: expected_assists # Understat xA - same blending purpose for `assists`
   sot: shots_on_target
   kp: key_passes
   tkw: tackles_won
@@ -24,6 +26,8 @@ forwards:
 midfielders:
   g: goals
   at: assists
+  xg: expected_goals
+  xa: expected_assists
   sot: shots_on_target
   kp: key_passes
   tkw: tackles_won
@@ -45,6 +49,8 @@ midfielders:
 defenders:
   g: goals
   at: assists
+  xg: expected_goals
+  xa: expected_assists
   sot: shots_on_target
   kp: key_passes
   tkw: tackles_won

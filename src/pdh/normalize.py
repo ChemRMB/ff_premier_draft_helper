@@ -72,6 +72,29 @@ def _coalesce_rowwise(df: pd.DataFrame, cols: list[str]) -> pd.Series:
     return df[avail].bfill(axis=1).iloc[:, 0]
 
 
+def blend_with_shrinkage(
+    actual: pd.Series, expected: pd.Series, sample_size: pd.Series, k: float = 900.0
+) -> pd.Series:
+    """
+    Empirical-Bayes-style shrinkage: blend an actual per-90 rate (noisy in
+    small samples - e.g. goals_p90 over a handful of matches, where finishing
+    variance dominates) toward a more stable expected rate (e.g. Understat's
+    xG_p90), trusting `actual` more as `sample_size` (typically minutes played)
+    grows. weight = sample_size / (sample_size + k); k is the sample size at
+    which actual and expected are weighted equally (default 900 minutes ~ 10
+    full matches).
+
+    Falls back to `expected` where `actual` is missing, and to `actual` where
+    `expected` is missing (e.g. player not found in the expected-goals source).
+    """
+    actual = pd.to_numeric(actual, errors="coerce")
+    expected = pd.to_numeric(expected, errors="coerce")
+    sample_size = pd.to_numeric(sample_size, errors="coerce").fillna(0.0)
+    weight = sample_size / (sample_size + k)
+    blended = weight * actual.fillna(expected) + (1 - weight) * expected.fillna(actual)
+    return blended.fillna(actual).fillna(expected)
+
+
 def normalize_player_matches(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
